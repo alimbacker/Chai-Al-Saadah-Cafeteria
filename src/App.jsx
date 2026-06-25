@@ -285,19 +285,18 @@ const SIDEBAR_GRAD = "linear-gradient(180deg,#2E1065 0%,#3B0A6B 48%,#26104F 100%
 const GOLD_GRAD = "linear-gradient(135deg,#E6C15A 0%,#C19A2B 50%,#9C7A1E 100%)";
 
 const ROLES = {
-  Owner: ["dashboard", "pos", "orders", "kitchen", "menu", "inventory", "expenses", "reports", "settings"],
+  Owner: ["dashboard", "pos", "orders", "kitchen", "menu", "inventory", "expenses", "reports", "users", "settings"],
   Manager: ["dashboard", "pos", "orders", "kitchen", "menu", "inventory", "expenses", "reports", "settings"],
   Cashier: ["pos", "orders", "dashboard", "expenses"],
   "Kitchen Staff": ["kitchen", "orders"],
 };
 
 // Staff accounts — sign in with an ID + PIN; the account decides the role.
-// (In the deployed build these live in Supabase Auth and are managed in Settings.)
-const STAFF = [
-  { id: "owner", pin: "1234", name: "Administrator", role: "Owner" },
-  { id: "manager", pin: "1234", name: "Manager", role: "Manager" },
-  { id: "cashier", pin: "1234", name: "Cashier", role: "Cashier" },
-  { id: "kitchen", pin: "1234", name: "Kitchen", role: "Kitchen Staff" },
+// Only the Owner can create more accounts (in the Users screen).
+// One bootstrap owner is provided for first sign-in — change its PIN in Users.
+// (In the deployed build these live in Supabase Auth.)
+const INITIAL_STAFF = [
+  { id: "owner", pin: "1234", name: "Owner", role: "Owner" },
 ];
 
 /* --------------------------- COUNT-UP HOOK -------------------------------- */
@@ -332,10 +331,11 @@ export default function App() {
 
   const [restaurant, setRestaurant] = useState(RESTAURANT_DEFAULT);
   const [items, setItems] = useState(INITIAL_ITEMS);
-  const [inventory, setInventory] = useState(INITIAL_INVENTORY);
-  const [orders, setOrders] = useState(() => seedOrders());
+  const [inventory, setInventory] = useState([]);
+  const [orders, setOrders] = useState([]);
   const [held, setHeld] = useState([]);
-  const [expenses, setExpenses] = useState(() => seedExpenses());
+  const [expenses, setExpenses] = useState([]);
+  const [staff, setStaff] = useState(INITIAL_STAFF);
 
   // POS cart
   const [lines, setLines] = useState([]);
@@ -495,12 +495,11 @@ export default function App() {
   }, [expenses]);
 
   function resetDemo() {
-    setOrders(seedOrders()); setItems(INITIAL_ITEMS); setInventory(INITIAL_INVENTORY);
-    setHeld([]); setExpenses(seedExpenses()); clearCart(); flash("Demo data reset");
+    setOrders([]); setExpenses([]); setHeld([]); clearCart(); flash("Sales & expenses cleared");
   }
 
   /* ----------------------------- RENDER ---------------------------------- */
-  if (!user) return <Login onLogin={(u) => { setUser(u); setView(ROLES[u.role][0]); }} />;
+  if (!user) return <Login onLogin={(u) => { setUser(u); setView(ROLES[u.role][0]); }} staff={staff} />;
 
   const navItems = [
     { id: "dashboard", label: "Dashboard", Icon: LayoutDashboard },
@@ -511,6 +510,7 @@ export default function App() {
     { id: "inventory", label: "Inventory", Icon: Package },
     { id: "expenses", label: "Expenses", Icon: ReceiptIcon },
     { id: "reports", label: "Reports", Icon: BarChart3 },
+    { id: "users", label: "Users", Icon: Users },
     { id: "settings", label: "Settings", Icon: SettingsIcon },
   ].filter((n) => allowed.includes(n.id));
 
@@ -629,6 +629,7 @@ export default function App() {
           {view === "inventory" && <Inventory inventory={inventory} setInventory={setInventory} flash={flash} />}
           {view === "expenses" && <Expenses expenses={expenses} setExpenses={setExpenses} flash={flash} user={user} />}
           {view === "reports" && <Reports orders={orders} todays={todays} items={items} restaurant={restaurant} expenses={expenses} />}
+          {view === "users" && <UsersView staff={staff} setStaff={setStaff} currentUser={user} flash={flash} />}
           {view === "settings" && <SettingsView restaurant={restaurant} setRestaurant={setRestaurant} dark={dark} setDark={setDark} resetDemo={resetDemo} flash={flash} user={user} />}
         </div>
       </main>
@@ -660,18 +661,16 @@ export default function App() {
 }
 
 /* ============================== LOGIN ===================================== */
-function Login({ onLogin }) {
+function Login({ onLogin, staff = [] }) {
   const [id, setId] = useState("");
   const [pin, setPin] = useState("");
   const [err, setErr] = useState("");
-  const [showDemo, setShowDemo] = useState(false);
 
   const submit = () => {
-    const acct = STAFF.find((s) => s.id.toLowerCase() === id.trim().toLowerCase() && s.pin === pin.trim());
+    const acct = staff.find((s) => s.id.toLowerCase() === id.trim().toLowerCase() && s.pin === pin.trim());
     if (!acct) { setErr("Invalid staff ID or PIN."); return; }
     onLogin({ role: acct.role, name: acct.name, id: acct.id });
   };
-  const quick = (s) => { setId(s.id); setPin(s.pin); setErr(""); };
   const ready = id.trim() && pin.trim();
 
   return (
@@ -711,24 +710,10 @@ function Login({ onLogin }) {
           </button>
         </div>
 
-        {/* Demo logins — hidden until requested, so the main screen stays a single sign-in */}
-        <div className="mt-5 pt-4 border-t" style={{ borderColor: "#ECE8F7" }}>
-          <button onClick={() => setShowDemo((v) => !v)} className="text-[11px] font-semibold flex items-center justify-center gap-1 mx-auto" style={{ color: "#6D28D9" }}>
-            {showDemo ? "Hide demo logins" : "Use a demo login"}
-            <span style={{ display: "inline-block", transform: showDemo ? "rotate(180deg)" : "none", transition: "transform .2s" }}>▾</span>
-          </button>
-          {showDemo && (
-            <div className="mt-3 space-y-1.5">
-              <p className="text-[10px] text-center mb-2" style={{ color: "#A79FC6" }}>PIN for every demo account is 1234 — tap one to fill</p>
-              {STAFF.map((s) => (
-                <button key={s.id} onClick={() => quick(s)} className="w-full flex items-center justify-between px-3 py-2 rounded-lg text-left transition-all" style={{ background: "#F7F5FD", border: "1px solid #ECE8F7" }}>
-                  <span className="text-xs"><b style={{ color: "#241B43" }}>{s.id}</b> <span style={{ color: "#A79FC6" }}>/ {s.pin}</span></span>
-                  <span className="text-[11px] font-medium" style={{ color: "#6D28D9" }}>{s.role}</span>
-                </button>
-              ))}
-            </div>
-          )}
-        </div>
+        {/* First-run hint — the owner creates all other staff IDs in the Users screen */}
+        <p className="mt-5 text-center text-[11px] leading-relaxed" style={{ color: "#A79FC6" }}>
+          First time? Sign in as <b style={{ color: "#6D28D9" }}>owner</b> / <b style={{ color: "#6D28D9" }}>1234</b>,<br />then add staff &amp; change PINs in <b style={{ color: "#6D28D9" }}>Users</b>.
+        </p>
 
         <p className="mt-4 text-center text-[11px]" style={{ color: "#A79FC6" }}>VAT 105182070000001 • Dibba Municipality 09883</p>
       </div>
@@ -1341,7 +1326,20 @@ function ItemEditor({ item, onClose, onSave }) {
 
 /* ============================ INVENTORY ================================ */
 function Inventory({ inventory, setInventory, flash }) {
+  const [name, setName] = useState("");
+  const [unit, setUnit] = useState("kg");
+  const [stock, setStock] = useState("");
+  const [min, setMin] = useState("");
+  const [cost, setCost] = useState("");
   const adjust = (id, delta) => setInventory((prev) => prev.map((i) => i.id === id ? { ...i, stock: Math.max(0, round2(i.stock + delta)) } : i));
+  const remove = (id) => { setInventory((prev) => prev.filter((i) => i.id !== id)); flash("Material removed"); };
+  const add = () => {
+    if (!name.trim()) { flash("Enter a material name", "err"); return; }
+    const item = { id: "R" + Date.now(), name: name.trim(), unit: unit.trim() || "unit", stock: round2(stock) || 0, min: round2(min) || 0, cost: round2(cost) || 0 };
+    setInventory((prev) => [...prev, item]);
+    setName(""); setStock(""); setMin(""); setCost("");
+    flash("Material added");
+  };
   const totalValue = inventory.reduce((s, i) => s + i.stock * i.cost, 0);
   const low = inventory.filter((i) => i.stock <= i.min);
   return (
@@ -1351,6 +1349,26 @@ function Inventory({ inventory, setInventory, flash }) {
         <Stat label="Items Tracked" value={inventory.length} color="#C19A2B" Icon={Layers} big />
         <Stat label="Low Stock" value={low.length} color={low.length ? "#E6553A" : "#1F9D6B"} Icon={AlertTriangle} big />
       </div>
+
+      {/* Add raw material */}
+      <Card>
+        <CardHead title="Add Raw Material" sub="Build your real stock list" />
+        <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mt-3">
+          <Field label="Material"><input value={name} onChange={(e) => setName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && add()} placeholder="e.g. Chicken" className="modal-input" /></Field>
+          <Field label="Unit">
+            <select value={unit} onChange={(e) => setUnit(e.target.value)} className="modal-input">
+              {["kg", "g", "litre", "ml", "pcs", "pack", "box"].map((u) => <option key={u} value={u}>{u}</option>)}
+            </select>
+          </Field>
+          <Field label="Current stock"><input type="number" inputMode="decimal" value={stock} onChange={(e) => setStock(e.target.value)} placeholder="0" className="modal-input tnum" /></Field>
+          <Field label="Min level"><input type="number" inputMode="decimal" value={min} onChange={(e) => setMin(e.target.value)} placeholder="0" className="modal-input tnum" /></Field>
+          <Field label="Cost / unit (AED)"><input type="number" inputMode="decimal" value={cost} onChange={(e) => setCost(e.target.value)} placeholder="0.00" className="modal-input tnum" /></Field>
+        </div>
+        <button onClick={add} className="mt-3 inline-flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-bold text-white" style={{ background: SIDEBAR_GRAD }}>
+          <Plus size={16} /> Add Material
+        </button>
+      </Card>
+
       {low.length > 0 && (
         <div className="flex items-center gap-2 px-4 py-3 rounded-xl text-sm" style={{ background: "#FDE9E5", color: "#B23A22" }}>
           <AlertTriangle size={16} /> <b>{low.length} ingredients</b> at or below minimum: {low.map((i) => i.name).join(", ")}
@@ -1367,10 +1385,13 @@ function Inventory({ inventory, setInventory, flash }) {
                 <th className="text-right font-semibold px-4 py-3 hidden md:table-cell">Value</th>
                 <th className="text-center font-semibold px-4 py-3">Status</th>
                 <th className="text-right font-semibold px-4 py-3">Adjust</th>
+                <th className="text-right font-semibold px-4 py-3"></th>
               </tr>
             </thead>
             <tbody>
-              {inventory.map((i) => {
+              {inventory.length === 0 ? (
+                <tr><td colSpan={7} className="px-4 py-10"><Empty msg="No materials yet — add your real stock above" /></td></tr>
+              ) : inventory.map((i) => {
                 const isLow = i.stock <= i.min;
                 return (
                   <tr key={i.id} style={{ borderBottom: "1px solid var(--line)" }} className="menu-row">
@@ -1386,6 +1407,9 @@ function Inventory({ inventory, setInventory, flash }) {
                       <span className="inline-block w-8" />
                       <QtyBtn onClick={() => adjust(i.id, 5)}><Plus size={13} /></QtyBtn>
                     </td>
+                    <td className="px-4 py-2.5 text-right">
+                      <button onClick={() => remove(i.id)} className="w-8 h-8 rounded-lg inline-flex items-center justify-center" style={{ color: "#E6553A", background: "var(--surface2)" }} aria-label="Delete material"><Trash2 size={14} /></button>
+                    </td>
                   </tr>
                 );
               })}
@@ -1399,6 +1423,100 @@ function Inventory({ inventory, setInventory, flash }) {
 }
 
 /* ============================= REPORTS ================================= */
+function UsersView({ staff, setStaff, currentUser, flash }) {
+  const ROLE_OPTS = ["Owner", "Manager", "Cashier", "Kitchen Staff"];
+  const [id, setId] = useState("");
+  const [name, setName] = useState("");
+  const [role, setRole] = useState("Cashier");
+  const [pin, setPin] = useState("");
+  const [editId, setEditId] = useState(null);
+  const [newPin, setNewPin] = useState("");
+  const ownerCount = staff.filter((s) => s.role === "Owner").length;
+
+  const add = () => {
+    const cleanId = id.trim().toLowerCase().replace(/\s+/g, "");
+    if (!cleanId) { flash("Enter a staff ID", "err"); return; }
+    if (!name.trim()) { flash("Enter a name", "err"); return; }
+    if (pin.trim().length < 4) { flash("PIN must be at least 4 digits", "err"); return; }
+    if (staff.some((s) => s.id.toLowerCase() === cleanId)) { flash("That ID already exists", "err"); return; }
+    setStaff((xs) => [...xs, { id: cleanId, name: name.trim(), role, pin: pin.trim() }]);
+    setId(""); setName(""); setPin(""); setRole("Cashier");
+    flash(`${role} account created`);
+  };
+  const remove = (sid) => {
+    const s = staff.find((x) => x.id === sid);
+    if (!s) return;
+    if (sid === currentUser.id) { flash("You can't delete the account you're signed in with", "err"); return; }
+    if (s.role === "Owner" && ownerCount <= 1) { flash("At least one Owner is required", "err"); return; }
+    setStaff((xs) => xs.filter((x) => x.id !== sid));
+    flash("Account removed");
+  };
+  const savePin = (sid) => {
+    if (newPin.trim().length < 4) { flash("PIN must be at least 4 digits", "err"); return; }
+    setStaff((xs) => xs.map((x) => x.id === sid ? { ...x, pin: newPin.trim() } : x));
+    setEditId(null); setNewPin("");
+    flash("PIN updated");
+  };
+  const roleBadge = (r) => {
+    const map = { Owner: "#6D28D9", Manager: "#C19A2B", Cashier: "#1F9D6B", "Kitchen Staff": "#E6553A" };
+    const c = map[r] || "#6D28D9";
+    return <span className="text-[11px] font-bold px-2 py-0.5 rounded-full" style={{ background: c + "1A", color: c }}>{r}</span>;
+  };
+
+  return (
+    <div className="p-4 md:p-6 space-y-4">
+      <Card>
+        <CardHead title="Create Staff Login" sub="Only the owner can add accounts. Staff sign in with their ID + PIN." />
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-3">
+          <Field label="Staff ID"><input value={id} onChange={(e) => setId(e.target.value)} placeholder="e.g. ramesh" className="modal-input" /></Field>
+          <Field label="Full name"><input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Ramesh K." className="modal-input" /></Field>
+          <Field label="Role">
+            <select value={role} onChange={(e) => setRole(e.target.value)} className="modal-input">
+              {ROLE_OPTS.map((r) => <option key={r} value={r}>{r}</option>)}
+            </select>
+          </Field>
+          <Field label="PIN (min 4 digits)"><input type="password" inputMode="numeric" value={pin} onChange={(e) => setPin(e.target.value)} onKeyDown={(e) => e.key === "Enter" && add()} placeholder="••••" className="modal-input tracking-widest" /></Field>
+        </div>
+        <button onClick={add} className="mt-3 inline-flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-bold text-white" style={{ background: SIDEBAR_GRAD }}>
+          <Plus size={16} /> Create Account
+        </button>
+      </Card>
+
+      <Card pad="p-0">
+        <CardHead title="Staff Accounts" sub={`${staff.length} ${staff.length === 1 ? "account" : "accounts"}`} className="px-4 pt-4" />
+        <div className="mt-2 divide-y" style={{ borderColor: "var(--line)" }}>
+          {staff.map((s) => (
+            <div key={s.id} className="px-4 py-3">
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-xl flex items-center justify-center text-sm font-bold shrink-0" style={{ background: "var(--surface2)", color: "var(--purple)" }}>{s.name[0]?.toUpperCase()}</div>
+                <div className="min-w-0 flex-1">
+                  <div className="text-sm font-semibold truncate" style={{ color: "var(--ink)" }}>{s.name} {s.id === currentUser.id && <span className="text-[10px] font-medium" style={{ color: "var(--muted)" }}>(you)</span>}</div>
+                  <div className="text-[11px]" style={{ color: "var(--muted)" }}>ID: {s.id} · PIN ••••</div>
+                </div>
+                {roleBadge(s.role)}
+                <button onClick={() => { setEditId(editId === s.id ? null : s.id); setNewPin(""); }} className="text-[11px] font-semibold px-2.5 py-1.5 rounded-lg" style={{ color: "var(--purple)", background: "var(--surface2)" }}>PIN</button>
+                <button onClick={() => remove(s.id)} className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ color: "#E6553A", background: "var(--surface2)" }} aria-label="Delete account"><Trash2 size={15} /></button>
+              </div>
+              {editId === s.id && (
+                <div className="flex items-center gap-2 mt-2.5 pl-12">
+                  <input type="password" inputMode="numeric" value={newPin} onChange={(e) => setNewPin(e.target.value)} onKeyDown={(e) => e.key === "Enter" && savePin(s.id)} placeholder="New PIN (min 4)" className="modal-input tracking-widest" style={{ maxWidth: 180 }} autoFocus />
+                  <button onClick={() => savePin(s.id)} className="px-3 py-2 rounded-lg text-sm font-bold text-white" style={{ background: SIDEBAR_GRAD }}>Save</button>
+                  <button onClick={() => { setEditId(null); setNewPin(""); }} className="px-3 py-2 rounded-lg text-sm font-medium" style={{ color: "var(--muted)", background: "var(--surface2)" }}>Cancel</button>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      </Card>
+
+      <div className="flex items-start gap-2 px-4 py-3 rounded-xl text-xs" style={{ background: "var(--surface2)", color: "var(--muted)" }}>
+        <Lock size={14} className="shrink-0 mt-0.5" />
+        <span>Accounts here are stored for this session. When you connect Supabase, these become real, permanent logins managed from this same screen — only the Owner role can reach it.</span>
+      </div>
+    </div>
+  );
+}
+
 function Expenses({ expenses, setExpenses, flash, user }) {
   const todayStr = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; };
   const [cat, setCat] = useState("ingredients");
@@ -1789,7 +1907,7 @@ function SettingsView({ restaurant, setRestaurant, dark, setDark, resetDemo, fla
         </div>
         <div className="flex gap-2 mt-4">
           <button onClick={save} className="flex items-center gap-1.5 px-5 py-2.5 rounded-xl text-sm font-bold text-white" style={{ background: SIDEBAR_GRAD }}><Save size={15} /> Save settings</button>
-          <button onClick={resetDemo} className="flex items-center gap-1.5 px-5 py-2.5 rounded-xl text-sm font-semibold" style={{ background: "var(--surface)", color: "#E6553A", border: "1px solid var(--line)" }}><RotateCcw size={15} /> Reset demo data</button>
+          <button onClick={resetDemo} className="flex items-center gap-1.5 px-5 py-2.5 rounded-xl text-sm font-semibold" style={{ background: "var(--surface)", color: "#E6553A", border: "1px solid var(--line)" }}><RotateCcw size={15} /> Clear sales &amp; expenses</button>
         </div>
       </Card>
 
@@ -1826,7 +1944,45 @@ function Receipt({ order, restaurant, onClose, flash }) {
 
   const wa = () => window.open(`https://wa.me/${(order.customer.phone || "").replace(/\D/g, "")}?text=${encodeURIComponent(billText)}`, "_blank");
   const email = () => { window.location.href = `mailto:?subject=${encodeURIComponent(`Tax Invoice — ${restaurant.name} #${order.ref}`)}&body=${encodeURIComponent(billText)}`; };
-  const print = () => window.print();
+  const print = () => {
+    const esc = (s) => String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    const dtStr = dt.toLocaleDateString("en-GB") + " " + dt.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+    const bi = (en, ar, val, o = {}) =>
+      `<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;${o.bold ? "font-weight:700;" : ""}${o.top ? "border-top:1px solid #555;padding-top:4px;margin-top:2px;" : ""}"><span style="line-height:1.15;">${en}${ar ? `<br><span dir="rtl" style="font-size:8px;color:#555;">${ar}</span>` : ""}</span><span style="white-space:nowrap;text-align:right;">${val}</span></div>`;
+    const itemRows = order.lines.map((l) => `<div style="display:flex;justify-content:space-between;padding:1px 0;"><span>${l.qty} &times; ${esc(l.name)}</span><span>${money(l.price * l.qty)}</span></div>`).join("");
+    const html =
+      `<!doctype html><html><head><meta charset="utf-8"><title>Receipt ${order.ref}</title><style>@page{size:80mm auto;margin:4mm}*{box-sizing:border-box}body{font-family:'Courier New',monospace;color:#000;width:72mm;margin:0 auto;font-size:11px}.c{text-align:center}.dv{border-top:1px dashed #555;margin:6px 0}img.logo{width:62px;height:auto;display:block;margin:0 auto 4px}</style></head><body>` +
+      `<div class="c"><img class="logo" src="${LOGO_SRC}" alt=""/><div style="font-weight:700;font-size:14px;">${esc(restaurant.name)}</div><div dir="rtl" style="font-size:12px;">${esc(restaurant.arabicName)}</div><div style="font-size:10px;">${esc(restaurant.address1)}<br>${esc(restaurant.address2)}</div><div style="font-size:10px;">Tel/&#1607;&#1575;&#1578;&#1601;: ${esc(restaurant.phone1)}</div><div style="font-size:10px;font-weight:700;">VAT/&#1575;&#1604;&#1585;&#1602;&#1605; &#1575;&#1604;&#1590;&#1585;&#1610;&#1576;&#1610;: ${esc(restaurant.vat)}</div></div>` +
+      `<div style="border-top:1px dashed #555;border-bottom:1px dashed #555;text-align:center;font-weight:700;margin:6px 0;padding:3px 0;">${esc(restaurant.receiptHeader)}</div>` +
+      `<div style="display:flex;justify-content:space-between;"><span>Order #: <b>${order.ref}</b></span><span>${esc(order.type)}${order.table ? " &middot; T" + esc(order.table) : ""}</span></div>` +
+      `<div style="display:flex;justify-content:space-between;"><span>Items: ${order.totals.itemCount}</span><span>${dtStr}</span></div>` +
+      `<div>Customer: ${esc(order.customer.name || "—")}</div><div class="dv"></div>` +
+      `<div style="display:flex;justify-content:space-between;font-weight:700;font-size:10px;"><span>DESCRIPTION</span><span>TOTAL</span></div>${itemRows}<div class="dv"></div>` +
+      bi("Subtotal", "&#1575;&#1604;&#1605;&#1580;&#1605;&#1608;&#1593; &#1575;&#1604;&#1601;&#1585;&#1593;&#1610;", `AED ${money(t.grossSubtotal)}`) +
+      (t.discountAmt > 0 ? bi("Discount", "&#1575;&#1604;&#1582;&#1589;&#1605;", `&minus; ${money(t.discountAmt)}`) : "") +
+      (t.serviceAmt > 0 ? bi("Service", "&#1585;&#1587;&#1608;&#1605; &#1575;&#1604;&#1582;&#1583;&#1605;&#1577;", `AED ${money(t.serviceAmt)}`) : "") +
+      bi("Net Amount", "&#1575;&#1604;&#1605;&#1576;&#1604;&#1594; &#1575;&#1604;&#1589;&#1575;&#1601;&#1610;", `AED ${money(t.netAmount)}`) +
+      bi("VAT (5%)", "&#1590;&#1585;&#1610;&#1576;&#1577; &#1575;&#1604;&#1602;&#1610;&#1605;&#1577; &#1575;&#1604;&#1605;&#1590;&#1575;&#1601;&#1577;", `AED ${money(t.vatAmount)}`) +
+      bi("GRAND TOTAL", "&#1575;&#1604;&#1573;&#1580;&#1605;&#1575;&#1604;&#1610; &#1575;&#1604;&#1593;&#1575;&#1605;", `AED ${money(t.grandTotal)}`, { bold: true, top: true }) +
+      `<div class="dv"></div>` +
+      bi(`Paid &middot; ${esc(order.payment.method)}`, `${PAY_AR[order.payment.method] || ""}`, `AED ${money(order.payment.method === "Cash" ? order.payment.tendered : t.grandTotal)}`) +
+      (order.payment.method === "Cash" ? bi("Change", "&#1575;&#1604;&#1605;&#1576;&#1604;&#1594; &#1575;&#1604;&#1605;&#1578;&#1576;&#1602;&#1610;", `AED ${money(Math.max(0, order.payment.tendered - t.grandTotal))}`) : "") +
+      `<div class="c" style="margin-top:10px;"><div>Served by: ${esc(order.cashier)}</div><div style="font-weight:700;margin-top:4px;">${esc(restaurant.receiptFooter)}</div></div></body></html>`;
+
+    const frame = document.createElement("iframe");
+    frame.setAttribute("aria-hidden", "true");
+    frame.style.cssText = "position:fixed;right:0;bottom:0;width:0;height:0;border:0;";
+    document.body.appendChild(frame);
+    const cw = frame.contentWindow;
+    cw.document.open(); cw.document.write(html); cw.document.close();
+    const fire = () => {
+      try { cw.focus(); cw.print(); } catch (e) { try { window.print(); } catch (_) {} }
+      setTimeout(() => { try { document.body.removeChild(frame); } catch (_) {} }, 1000);
+    };
+    const img = cw.document.querySelector("img.logo");
+    if (img && !img.complete) { img.onload = () => setTimeout(fire, 60); img.onerror = () => setTimeout(fire, 60); setTimeout(fire, 900); }
+    else setTimeout(fire, 150);
+  };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 modal-overlay no-print" onClick={onClose} style={{ background: "rgba(20,10,40,0.55)" }}>
