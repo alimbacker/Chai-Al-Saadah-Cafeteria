@@ -337,6 +337,36 @@ export default function App() {
   const [held, setHeld] = useState([]);
   const [expenses, setExpenses] = useState([]);
   const [staff, setStaff] = useState(INITIAL_STAFF);
+  const [storageReady, setStorageReady] = useState(false);
+
+  // ---- Persistent storage: load on mount ----
+  useEffect(() => {
+    (async () => {
+      try {
+        const staffRes = await window.storage.get("chai_staff");
+        if (staffRes && staffRes.value) { const p = JSON.parse(staffRes.value); if (Array.isArray(p) && p.length > 0) setStaff(p); }
+        const ordersRes = await window.storage.get("chai_orders");
+        if (ordersRes && ordersRes.value) { const p = JSON.parse(ordersRes.value); if (Array.isArray(p)) setOrders(p); }
+        const expRes = await window.storage.get("chai_expenses");
+        if (expRes && expRes.value) { const p = JSON.parse(expRes.value); if (Array.isArray(p)) setExpenses(p); }
+        const invRes = await window.storage.get("chai_inventory");
+        if (invRes && invRes.value) { const p = JSON.parse(invRes.value); if (Array.isArray(p)) setInventory(p); }
+        const restRes = await window.storage.get("chai_restaurant");
+        if (restRes && restRes.value) { const p = JSON.parse(restRes.value); if (p && typeof p === "object") setRestaurant(p); }
+        const menuRes = await window.storage.get("chai_menu");
+        if (menuRes && menuRes.value) { const p = JSON.parse(menuRes.value); if (Array.isArray(p) && p.length > 0) setItems(p); }
+      } catch (e) { console.log("Storage load (first run):", e); }
+      setStorageReady(true);
+    })();
+  }, []);
+
+  // ---- Persist on change (only after initial load) ----
+  useEffect(() => { if (storageReady) { try { window.storage.set("chai_staff", JSON.stringify(staff)); } catch(e){} } }, [staff, storageReady]);
+  useEffect(() => { if (storageReady) { try { window.storage.set("chai_orders", JSON.stringify(orders)); } catch(e){} } }, [orders, storageReady]);
+  useEffect(() => { if (storageReady) { try { window.storage.set("chai_expenses", JSON.stringify(expenses)); } catch(e){} } }, [expenses, storageReady]);
+  useEffect(() => { if (storageReady) { try { window.storage.set("chai_inventory", JSON.stringify(inventory)); } catch(e){} } }, [inventory, storageReady]);
+  useEffect(() => { if (storageReady) { try { window.storage.set("chai_restaurant", JSON.stringify(restaurant)); } catch(e){} } }, [restaurant, storageReady]);
+  useEffect(() => { if (storageReady) { try { window.storage.set("chai_menu", JSON.stringify(items)); } catch(e){} } }, [items, storageReady]);
 
   // POS cart
   const [lines, setLines] = useState([]);
@@ -496,7 +526,9 @@ export default function App() {
   }, [expenses]);
 
   function resetDemo() {
-    setOrders([]); setExpenses([]); setHeld([]); clearCart(); flash("Sales & expenses cleared");
+    setOrders([]); setExpenses([]); setHeld([]); clearCart();
+    try { window.storage.set("chai_orders", "[]"); window.storage.set("chai_expenses", "[]"); } catch(e){}
+    flash("Sales & expenses cleared");
   }
 
   /* ----------------------------- RENDER ---------------------------------- */
@@ -1507,7 +1539,7 @@ function UsersView({ staff, setStaff, currentUser, flash }) {
 
       <div className="flex items-start gap-2 px-4 py-3 rounded-xl text-xs" style={{ background: "var(--surface2)", color: "var(--muted)" }}>
         <Lock size={14} className="shrink-0 mt-0.5" />
-        <span>Accounts here are stored for this session. When you connect Supabase, these become real, permanent logins managed from this same screen — only the Super Admin role can reach it.</span>
+        <span>Accounts are saved permanently. Created users will persist even if you close the app. Only the Super Admin role can manage accounts from this screen.</span>
       </div>
     </div>
   );
@@ -1657,7 +1689,36 @@ function Expenses({ expenses, setExpenses, flash, user }) {
 
 function Reports({ orders, todays, items, restaurant, expenses = [] }) {
   const [range, setRange] = useState("today");
-  const data = range === "today" ? todays : orders;
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
+  const [showZReport, setShowZReport] = useState(false);
+
+  const todayStr = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; };
+
+  const data = useMemo(() => {
+    if (range === "today") return todays;
+    if (range === "all") return orders;
+    if (range === "yesterday") {
+      const y = new Date(); y.setDate(y.getDate() - 1); y.setHours(0,0,0,0);
+      const yEnd = new Date(y); yEnd.setHours(23,59,59,999);
+      return orders.filter((o) => { const d = new Date(o.createdAt); return d >= y && d <= yEnd; });
+    }
+    if (range === "week") {
+      const w = new Date(); w.setDate(w.getDate() - 7); w.setHours(0,0,0,0);
+      return orders.filter((o) => new Date(o.createdAt) >= w);
+    }
+    if (range === "month") {
+      const m = new Date(); m.setDate(1); m.setHours(0,0,0,0);
+      return orders.filter((o) => new Date(o.createdAt) >= m);
+    }
+    if (range === "custom" && dateFrom) {
+      const from = new Date(dateFrom); from.setHours(0,0,0,0);
+      const to = dateTo ? new Date(dateTo) : new Date(); to.setHours(23,59,59,999);
+      return orders.filter((o) => { const d = new Date(o.createdAt); return d >= from && d <= to; });
+    }
+    return todays;
+  }, [range, todays, orders, dateFrom, dateTo]);
+
   const done = data.filter((o) => o.status !== "Cancelled");
 
   const summary = useMemo(() => {
@@ -1671,9 +1732,22 @@ function Reports({ orders, todays, items, restaurant, expenses = [] }) {
 
   const expFiltered = useMemo(() => {
     if (range === "all") return expenses;
-    const d0 = new Date(); d0.setHours(0, 0, 0, 0);
+    if (range === "today") { const d0 = new Date(); d0.setHours(0,0,0,0); return expenses.filter((e) => new Date(e.createdAt) >= d0); }
+    if (range === "yesterday") {
+      const y = new Date(); y.setDate(y.getDate() - 1); y.setHours(0,0,0,0);
+      const yEnd = new Date(y); yEnd.setHours(23,59,59,999);
+      return expenses.filter((e) => { const d = new Date(e.createdAt); return d >= y && d <= yEnd; });
+    }
+    if (range === "week") { const w = new Date(); w.setDate(w.getDate() - 7); w.setHours(0,0,0,0); return expenses.filter((e) => new Date(e.createdAt) >= w); }
+    if (range === "month") { const m = new Date(); m.setDate(1); m.setHours(0,0,0,0); return expenses.filter((e) => new Date(e.createdAt) >= m); }
+    if (range === "custom" && dateFrom) {
+      const from = new Date(dateFrom); from.setHours(0,0,0,0);
+      const to = dateTo ? new Date(dateTo) : new Date(); to.setHours(23,59,59,999);
+      return expenses.filter((e) => { const d = new Date(e.createdAt); return d >= from && d <= to; });
+    }
+    const d0 = new Date(); d0.setHours(0,0,0,0);
     return expenses.filter((e) => new Date(e.createdAt) >= d0);
-  }, [expenses, range]);
+  }, [expenses, range, dateFrom, dateTo]);
   const expTotal = round2(expFiltered.reduce((s, e) => s + e.amount, 0));
   const expByCat = useMemo(() => {
     const m = {};
@@ -1702,6 +1776,60 @@ function Reports({ orders, todays, items, restaurant, expenses = [] }) {
     }));
     return Object.entries(m).map(([k, v]) => ({ category: k, value: round2(v) })).sort((a, b) => b.value - a.value);
   }, [done, items]);
+
+  // Category-wise quantity + revenue for Z Report
+  const byCatDetailed = useMemo(() => {
+    const m = {};
+    done.forEach((o) => o.lines.forEach((l) => {
+      const it = items.find((i) => i.id === l.itemId);
+      const cn = CATEGORIES.find((c) => c.id === it?.cat)?.name || "Other";
+      if (!m[cn]) m[cn] = { qty: 0, revenue: 0, items: {} };
+      m[cn].qty += l.qty;
+      m[cn].revenue += l.price * l.qty;
+      if (!m[cn].items[l.name]) m[cn].items[l.name] = { qty: 0, revenue: 0 };
+      m[cn].items[l.name].qty += l.qty;
+      m[cn].items[l.name].revenue += l.price * l.qty;
+    }));
+    return Object.entries(m).map(([cat, d]) => ({
+      category: cat, qty: d.qty, revenue: round2(d.revenue),
+      items: Object.entries(d.items).map(([name, v]) => ({ name, qty: v.qty, revenue: round2(v.revenue) })).sort((a, b) => b.revenue - a.revenue),
+    })).sort((a, b) => b.revenue - a.revenue);
+  }, [done, items]);
+
+  // Hourly breakdown for Z Report
+  const hourly = useMemo(() => {
+    const buckets = {};
+    for (let h = 0; h <= 23; h++) buckets[h] = { orders: 0, revenue: 0 };
+    done.forEach((o) => {
+      const h = new Date(o.createdAt).getHours();
+      buckets[h].orders += 1;
+      buckets[h].revenue += o.totals.grandTotal;
+    });
+    return Object.entries(buckets).filter(([, v]) => v.orders > 0).map(([h, v]) => ({ hour: `${h}:00`, orders: v.orders, revenue: round2(v.revenue) }));
+  }, [done]);
+
+  // Order type breakdown
+  const byType = useMemo(() => {
+    const m = {};
+    done.forEach((o) => {
+      if (!m[o.type]) m[o.type] = { count: 0, revenue: 0 };
+      m[o.type].count += 1;
+      m[o.type].revenue += o.totals.grandTotal;
+    });
+    return Object.entries(m).map(([type, v]) => ({ type, count: v.count, revenue: round2(v.revenue) }));
+  }, [done]);
+
+  // Cashier breakdown
+  const byCashier = useMemo(() => {
+    const m = {};
+    done.forEach((o) => {
+      const c = o.cashier || "Unknown";
+      if (!m[c]) m[c] = { count: 0, revenue: 0 };
+      m[c].count += 1;
+      m[c].revenue += o.totals.grandTotal;
+    });
+    return Object.entries(m).map(([name, v]) => ({ name, count: v.count, revenue: round2(v.revenue) }));
+  }, [done]);
 
   const itemSales = useMemo(() => {
     const m = {};
@@ -1742,66 +1870,130 @@ function Reports({ orders, todays, items, restaurant, expenses = [] }) {
       Vendor: e.vendor, Method: e.method, Amount: round2(e.amount),
     })));
     XLSX.utils.book_append_sheet(wb, ws3, "Expenses");
-    const ws4 = XLSX.utils.json_to_sheet([
-      { Metric: "Gross Sales", AED: round2(summary.sales) },
+    // Z Report summary sheet
+    const zRows = [
+      { Metric: "Gross Sales (incl. VAT)", AED: round2(summary.sales) },
       { Metric: "Net Sales (excl VAT)", AED: round2(summary.net) },
       { Metric: "VAT 5%", AED: round2(summary.vat) },
       { Metric: "Food Cost (COGS)", AED: round2(summary.net - summary.profit) },
       { Metric: "Gross Profit", AED: round2(summary.profit) },
       { Metric: "Expenses", AED: round2(expTotal) },
       { Metric: "Net Profit", AED: round2(netAfterExp) },
-    ]);
-    XLSX.utils.book_append_sheet(wb, ws4, "Summary");
+      { Metric: "---", AED: "---" },
+      { Metric: "Total Orders", AED: summary.count },
+      { Metric: "Cancelled Orders", AED: summary.cancelled },
+      { Metric: "Total Discounts Given", AED: round2(summary.disc) },
+    ];
+    byPay.forEach((p) => zRows.push({ Metric: `Payment: ${p.method}`, AED: p.value }));
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(zRows), "Z Report Summary");
+    // Category breakdown sheet
+    const catRows = [];
+    byCatDetailed.forEach((c) => {
+      catRows.push({ Item: `▸ ${c.category}`, Qty: c.qty, Revenue: c.revenue });
+      c.items.forEach((i) => catRows.push({ Item: `    ${i.name}`, Qty: i.qty, Revenue: i.revenue }));
+    });
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(catRows), "Category Breakdown");
     const out = XLSX.write(wb, { bookType: "xlsx", type: "array" });
     download(new Blob([out], { type: "application/octet-stream" }), `chai-sales-${range}.xlsx`);
   }
 
-  return (
-    <div className="p-4 md:p-6 space-y-4">
+  function printZReport() {
+    const dtStr = new Date().toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long", year: "numeric" });
+    const rangeLabel = range === "today" ? "Today" : range === "yesterday" ? "Yesterday" : range === "week" ? "This Week" : range === "month" ? "This Month" : range === "custom" ? `${dateFrom || ""} to ${dateTo || todayStr()}` : "All Time";
+    const esc = (s) => String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    let catHtml = "";
+    byCatDetailed.forEach((c) => {
+      catHtml += `<tr style="background:#f5f3ff;font-weight:700;"><td colspan="2" style="padding:4px 8px;">${esc(c.category)}</td><td style="text-align:right;padding:4px 8px;">${c.qty}</td><td style="text-align:right;padding:4px 8px;">${money(c.revenue)}</td></tr>`;
+      c.items.forEach((i) => {
+        catHtml += `<tr><td style="padding:2px 8px 2px 24px;" colspan="2">${esc(i.name)}</td><td style="text-align:right;padding:2px 8px;">${i.qty}</td><td style="text-align:right;padding:2px 8px;">${money(i.revenue)}</td></tr>`;
+      });
+    });
+    let payHtml = byPay.map((p) => `<tr><td style="padding:3px 8px;">${esc(p.method)}</td><td style="text-align:right;padding:3px 8px;">${money(p.value)}</td></tr>`).join("");
+    let typeHtml = byType.map((t) => `<tr><td style="padding:3px 8px;">${esc(t.type)}</td><td style="text-align:right;padding:3px 8px;">${t.count}</td><td style="text-align:right;padding:3px 8px;">${money(t.revenue)}</td></tr>`).join("");
+    let cashierHtml = byCashier.map((c) => `<tr><td style="padding:3px 8px;">${esc(c.name)}</td><td style="text-align:right;padding:3px 8px;">${c.count}</td><td style="text-align:right;padding:3px 8px;">${money(c.revenue)}</td></tr>`).join("");
+    let hourHtml = hourly.map((h) => `<tr><td style="padding:2px 8px;">${h.hour}</td><td style="text-align:right;padding:2px 8px;">${h.orders}</td><td style="text-align:right;padding:2px 8px;">${money(h.revenue)}</td></tr>`).join("");
+    let expHtml = expByCat.map((c) => `<tr><td style="padding:3px 8px;">${esc(c.category)}</td><td style="text-align:right;padding:3px 8px;">${money(c.value)}</td></tr>`).join("");
+
+    const html = `<!doctype html><html><head><meta charset="utf-8"><title>Z Report</title><style>@page{margin:10mm}*{box-sizing:border-box}body{font-family:Arial,sans-serif;color:#1a1a1a;font-size:11px;max-width:700px;margin:0 auto}h1{font-size:18px;margin:0}h2{font-size:13px;margin:16px 0 6px;padding:4px 8px;background:#2E1065;color:#fff;border-radius:4px}table{width:100%;border-collapse:collapse;margin-bottom:8px}th{text-align:left;padding:4px 8px;border-bottom:2px solid #2E1065;font-size:10px;text-transform:uppercase;color:#6D28D9}td{border-bottom:1px solid #eee}.hdr{display:flex;justify-content:space-between;align-items:center;border-bottom:3px double #2E1065;padding-bottom:10px;margin-bottom:10px}.sumr{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:10px}.sumr div{padding:6px 10px;background:#faf8ff;border:1px solid #ece8f7;border-radius:6px}.sumr .lbl{font-size:10px;color:#736C90}.sumr .val{font-size:14px;font-weight:700}</style></head><body>`
+      + `<div class="hdr"><div><h1>${esc(restaurant.name)}</h1><div style="font-size:12px;color:#736C90;">Z REPORT — End of Day Summary</div></div><div style="text-align:right"><div style="font-size:12px;font-weight:700;">${esc(rangeLabel)}</div><div style="font-size:10px;color:#736C90">${dtStr}</div><div style="font-size:9px;color:#999">VAT: ${esc(restaurant.vat)}</div></div></div>`
+      + `<div class="sumr"><div><div class="lbl">Gross Sales</div><div class="val">AED ${money(summary.sales)}</div></div><div><div class="lbl">Net Sales</div><div class="val">AED ${money(summary.net)}</div></div><div><div class="lbl">VAT Collected</div><div class="val">AED ${money(summary.vat)}</div></div><div><div class="lbl">Net Profit</div><div class="val" style="color:${netAfterExp >= 0 ? '#1F9D6B' : '#E6553A'}">AED ${money(netAfterExp)}</div></div><div><div class="lbl">Orders</div><div class="val">${summary.count}</div></div><div><div class="lbl">Cancelled</div><div class="val">${summary.cancelled}</div></div></div>`
+      + `<h2>Sales by Category (All ${CATEGORIES.length} Categories)</h2><table><tr><th colspan="2">Category / Item</th><th style="text-align:right">Qty</th><th style="text-align:right">Revenue</th></tr>${catHtml}${byCatDetailed.length === 0 ? '<tr><td colspan="4" style="text-align:center;padding:8px;color:#999">No sales data</td></tr>' : ''}<tr style="font-weight:700;border-top:2px solid #2E1065"><td colspan="2" style="padding:4px 8px">TOTAL</td><td style="text-align:right;padding:4px 8px">${done.reduce((s,o) => s + o.totals.itemCount, 0)}</td><td style="text-align:right;padding:4px 8px">${money(summary.sales)}</td></tr></table>`
+      + `<h2>Payment Methods</h2><table><tr><th>Method</th><th style="text-align:right">Amount (AED)</th></tr>${payHtml}<tr style="font-weight:700;border-top:2px solid #2E1065"><td style="padding:4px 8px">TOTAL</td><td style="text-align:right;padding:4px 8px">${money(summary.sales)}</td></tr></table>`
+      + `<h2>Order Types</h2><table><tr><th>Type</th><th style="text-align:right">Orders</th><th style="text-align:right">Revenue</th></tr>${typeHtml}</table>`
+      + `<h2>Cashier Summary</h2><table><tr><th>Cashier</th><th style="text-align:right">Orders</th><th style="text-align:right">Revenue</th></tr>${cashierHtml}</table>`
+      + `<h2>Hourly Breakdown</h2><table><tr><th>Hour</th><th style="text-align:right">Orders</th><th style="text-align:right">Revenue</th></tr>${hourHtml}</table>`
+      + `<h2>Profit & Loss</h2><table><tr><td style="padding:3px 8px">Gross Sales (incl. VAT)</td><td style="text-align:right;padding:3px 8px">${money(summary.sales)}</td></tr><tr><td style="padding:3px 8px">− VAT (5%)</td><td style="text-align:right;padding:3px 8px;color:#E6553A">− ${money(summary.vat)}</td></tr><tr style="font-weight:600"><td style="padding:3px 8px">Net Sales</td><td style="text-align:right;padding:3px 8px">${money(summary.net)}</td></tr><tr><td style="padding:3px 8px">− Food Cost (COGS)</td><td style="text-align:right;padding:3px 8px;color:#E6553A">− ${money(round2(summary.net - summary.profit))}</td></tr><tr style="font-weight:600"><td style="padding:3px 8px">Gross Profit</td><td style="text-align:right;padding:3px 8px">${money(summary.profit)}</td></tr><tr><td style="padding:3px 8px">− Expenses</td><td style="text-align:right;padding:3px 8px;color:#E6553A">− ${money(expTotal)}</td></tr><tr style="font-weight:700;border-top:2px solid #2E1065"><td style="padding:4px 8px">NET PROFIT</td><td style="text-align:right;padding:4px 8px;color:${netAfterExp >= 0 ? '#1F9D6B' : '#E6553A'}">${netAfterExp >= 0 ? '' : '− '}AED ${money(Math.abs(netAfterExp))}</td></tr></table>`
+      + `<h2>Expenses by Category</h2><table><tr><th>Category</th><th style="text-align:right">Amount</th></tr>${expHtml}${expByCat.length === 0 ? '<tr><td colspan="2" style="text-align:center;padding:8px;color:#999">No expenses</td></tr>' : ''}<tr style="font-weight:700;border-top:2px solid #2E1065"><td style="padding:4px 8px">TOTAL EXPENSES</td><td style="text-align:right;padding:4px 8px">${money(expTotal)}</td></tr></table>`
+      + `<div style="text-align:center;margin-top:20px;padding-top:10px;border-top:1px solid #eee;color:#999;font-size:9px">Generated by Chai Al Saadah POS · ${new Date().toLocaleString("en-GB")}</div></body></html>`;
+    const frame = document.createElement("iframe");
+    frame.style.cssText = "position:fixed;right:0;bottom:0;width:0;height:0;border:0;";
+    document.body.appendChild(frame);
+    const cw = frame.contentWindow;
+    cw.document.open(); cw.document.write(html); cw.document.close();
+    setTimeout(() => { try { cw.focus(); cw.print(); } catch(e){} setTimeout(() => { try { document.body.removeChild(frame); } catch(_){} }, 1000); }, 300);
+  }
+
+  // Z Report inline view
+  const ZReportView = () => (
+    <div className="space-y-4">
       <div className="flex items-center justify-between flex-wrap gap-2">
-        <div className="flex gap-1.5 p-1 rounded-xl" style={{ background: "var(--surface2)" }}>
-          {[["today", "Today"], ["all", "All Time"]].map(([k, l]) => (
-            <button key={k} onClick={() => setRange(k)} className="px-4 py-1.5 rounded-lg text-sm font-semibold"
-              style={{ background: range === k ? "var(--surface)" : "transparent", color: range === k ? "var(--purple)" : "var(--muted)", boxShadow: range === k ? "0 1px 4px rgba(0,0,0,0.08)" : "none" }}>{l}</button>
-          ))}
+        <div>
+          <h2 className="text-lg font-bold" style={{ fontFamily: "Fraunces, serif", color: "var(--ink)" }}>Z Report — End of Day</h2>
+          <p className="text-xs" style={{ color: "var(--muted)" }}>{range === "today" ? "Today" : range === "yesterday" ? "Yesterday" : range === "week" ? "This Week" : range === "month" ? "This Month" : range === "custom" ? `${dateFrom || ""} to ${dateTo || todayStr()}` : "All Time"} · {new Date().toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long", year: "numeric" })}</p>
         </div>
-        <div className="flex gap-2">
-          <button onClick={exportCSV} className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-semibold" style={{ background: "var(--surface)", color: "var(--ink)", border: "1px solid var(--line)" }}><Download size={15} /> CSV</button>
-          <button onClick={exportExcel} className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-bold text-white" style={{ background: SIDEBAR_GRAD }}><FileSpreadsheet size={15} /> Excel</button>
-        </div>
+        <button onClick={printZReport} className="flex items-center gap-1.5 px-4 py-2.5 rounded-xl text-sm font-bold text-white" style={{ background: SIDEBAR_GRAD }}>
+          <Printer size={15} /> Print Z Report
+        </button>
       </div>
 
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+      {/* Grand Summary */}
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
         <Stat label="Gross Sales" value={aed(summary.sales)} color="#6D28D9" Icon={TrendingUp} />
         <Stat label="Net Sales" value={aed(summary.net)} color="#9B7CF6" Icon={Wallet} />
         <Stat label="VAT (5%)" value={aed(summary.vat)} color="#C19A2B" Icon={FileText} />
-        <Stat label="Gross Profit" value={aed(summary.profit)} color="#1F9D6B" Icon={Coins} />
-        <Stat label="Expenses" value={aed(expTotal)} color="#E6553A" Icon={ReceiptIcon} />
-        <Stat label="Net Profit" value={aed(netAfterExp)} color="#1F9D6B" Icon={TrendingUp} />
-        <Stat label="Discounts" value={aed(summary.disc)} color="#C19A2B" Icon={Percent} />
+        <Stat label="Net Profit" value={aed(netAfterExp)} color={netAfterExp >= 0 ? "#1F9D6B" : "#E6553A"} Icon={Coins} />
         <Stat label="Orders" value={summary.count} color="#6D28D9" Icon={ClipboardList} />
+        <Stat label="Cancelled" value={summary.cancelled} color="#E6553A" Icon={XCircle} />
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <Card>
-          <CardHead title="Sales by Category" sub="Revenue (AED)" />
-          <div className="mt-3 space-y-2.5">
-            {byCat.length === 0 ? <Empty msg="No data" /> : byCat.map((c) => {
-              const pct = Math.round((c.value / byCat[0].value) * 100);
-              return (
-                <div key={c.category}>
-                  <div className="flex justify-between text-sm mb-1"><span style={{ color: "var(--ink)" }}>{c.category}</span><span className="font-bold tnum" style={{ color: "var(--purple)" }}>{money(c.value)}</span></div>
-                  <div className="h-2 rounded-full overflow-hidden" style={{ background: "var(--surface2)" }}>
-                    <div className="h-full rounded-full" style={{ width: `${pct}%`, background: GOLD_GRAD }} />
+      {/* Sales by ALL categories with item breakdown */}
+      <Card>
+        <CardHead title={`Sales by Category (All ${CATEGORIES.length} Categories)`} sub="Complete breakdown with items" />
+        <div className="mt-3 space-y-1">
+          {byCatDetailed.length === 0 ? <Empty msg="No sales data in this range" /> : byCatDetailed.map((c) => {
+            const pct = byCatDetailed[0].revenue ? Math.round((c.revenue / byCatDetailed[0].revenue) * 100) : 0;
+            const catEmoji = CATEGORIES.find((x) => x.name === c.category)?.emoji || "📋";
+            return (
+              <div key={c.category} className="rounded-xl overflow-hidden" style={{ border: "1px solid var(--line)" }}>
+                <div className="flex items-center justify-between px-4 py-2.5" style={{ background: "var(--surface2)" }}>
+                  <span className="font-semibold text-sm" style={{ color: "var(--ink)" }}>{catEmoji} {c.category}</span>
+                  <div className="flex items-center gap-3">
+                    <span className="text-xs" style={{ color: "var(--muted)" }}>{c.qty} items</span>
+                    <span className="font-bold tnum text-sm" style={{ color: "var(--purple)" }}>{aed(c.revenue)}</span>
                   </div>
                 </div>
-              );
-            })}
-          </div>
-        </Card>
+                <div className="px-4">
+                  {c.items.map((i) => (
+                    <div key={i.name} className="flex justify-between py-1.5 text-xs" style={{ borderBottom: "1px solid var(--line)" }}>
+                      <span style={{ color: "var(--ink)" }}>{i.name}</span>
+                      <div className="flex gap-4">
+                        <span className="tnum" style={{ color: "var(--muted)" }}>×{i.qty}</span>
+                        <span className="tnum font-semibold" style={{ color: "var(--ink)", minWidth: 60, textAlign: "right" }}>{money(i.revenue)}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </Card>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {/* Payment Methods */}
         <Card>
-          <CardHead title="Payment Method Report" sub="Collections (AED)" />
-          <div className="mt-3 space-y-3">
+          <CardHead title="Payment Method Totals" sub="Cash drawer & digital" />
+          <div className="mt-3 space-y-2.5">
             {byPay.length === 0 ? <Empty msg="No data" /> : byPay.map((p) => (
               <div key={p.method} className="flex items-center justify-between p-3 rounded-xl" style={{ background: "var(--surface2)" }}>
                 <div className="flex items-center gap-2">
@@ -1813,9 +2005,86 @@ function Reports({ orders, todays, items, restaurant, expenses = [] }) {
             ))}
           </div>
         </Card>
+
+        {/* Order Types */}
+        <Card>
+          <CardHead title="Order Type Breakdown" sub="Dine In / Take Away / Delivery" />
+          <div className="mt-3 space-y-2.5">
+            {byType.length === 0 ? <Empty msg="No data" /> : byType.map((t) => (
+              <div key={t.type} className="flex items-center justify-between p-3 rounded-xl" style={{ background: "var(--surface2)" }}>
+                <span className="font-medium" style={{ color: "var(--ink)" }}>{t.type}</span>
+                <div className="flex items-center gap-3">
+                  <span className="text-xs" style={{ color: "var(--muted)" }}>{t.count} orders</span>
+                  <span className="font-bold tnum" style={{ color: "var(--ink)" }}>{aed(t.revenue)}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </Card>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {/* Cashier summary */}
+        <Card>
+          <CardHead title="Cashier Summary" sub="Sales per staff" />
+          <div className="mt-3 space-y-2.5">
+            {byCashier.length === 0 ? <Empty msg="No data" /> : byCashier.map((c) => (
+              <div key={c.name} className="flex items-center justify-between p-3 rounded-xl" style={{ background: "var(--surface2)" }}>
+                <div className="flex items-center gap-2">
+                  <div className="w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold" style={{ background: GOLD_GRAD, color: "#2E1065" }}>{c.name[0]}</div>
+                  <span className="font-medium" style={{ color: "var(--ink)" }}>{c.name}</span>
+                </div>
+                <div className="flex items-center gap-3">
+                  <span className="text-xs" style={{ color: "var(--muted)" }}>{c.count} orders</span>
+                  <span className="font-bold tnum" style={{ color: "var(--ink)" }}>{aed(c.revenue)}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </Card>
+
+        {/* Hourly breakdown */}
+        <Card>
+          <CardHead title="Hourly Breakdown" sub="Peak hours" />
+          <div className="mt-3 space-y-1">
+            {hourly.length === 0 ? <Empty msg="No data" /> : hourly.map((h) => {
+              const maxRev = Math.max(...hourly.map((x) => x.revenue));
+              const pct = maxRev ? Math.round((h.revenue / maxRev) * 100) : 0;
+              return (
+                <div key={h.hour}>
+                  <div className="flex justify-between text-xs mb-0.5">
+                    <span style={{ color: "var(--ink)" }}>{h.hour} <span style={{ color: "var(--muted)" }}>({h.orders} orders)</span></span>
+                    <span className="font-bold tnum" style={{ color: "var(--purple)" }}>{money(h.revenue)}</span>
+                  </div>
+                  <div className="h-1.5 rounded-full overflow-hidden" style={{ background: "var(--surface2)" }}>
+                    <div className="h-full rounded-full" style={{ width: `${pct}%`, background: GOLD_GRAD }} />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </Card>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {/* P&L */}
+        <Card>
+          <CardHead title="Profit & Loss Statement" sub="Complete P&L" />
+          <div className="mt-3 space-y-2.5 text-sm">
+            <KV k="Gross Sales (incl. VAT)" v={aed(summary.sales)} />
+            <KV k="− VAT (5%)" v={`− ${money(summary.vat)}`} danger />
+            <div className="h-px" style={{ background: "var(--line)" }} />
+            <KV k="Net Sales" v={aed(summary.net)} bold />
+            <KV k="− Food Cost (COGS)" v={`− ${money(round2(summary.net - summary.profit))}`} danger />
+            <KV k="= Gross Profit" v={aed(summary.profit)} bold />
+            <KV k="− Total Expenses" v={`− ${money(expTotal)}`} danger />
+            <KV k="Discounts Given" v={`− ${money(summary.disc)}`} danger />
+            <div className="h-px" style={{ background: "var(--line)" }} />
+            <KV k="NET PROFIT / LOSS" v={`${netAfterExp >= 0 ? '' : '− '}AED ${money(Math.abs(netAfterExp))}`} bold big />
+          </div>
+        </Card>
+
+        {/* Expenses */}
         <Card>
           <CardHead title="Expenses by Category" sub={`Total ${aed(expTotal)}`} />
           <div className="mt-3 space-y-2.5">
@@ -1832,43 +2101,143 @@ function Reports({ orders, todays, items, restaurant, expenses = [] }) {
             })}
           </div>
         </Card>
-        <Card>
-          <CardHead title="Profit Summary" sub="After food cost & expenses" />
-          <div className="mt-3 space-y-2.5 text-sm">
-            <KV k="Net Sales (excl. VAT)" v={aed(summary.net)} />
-            <KV k="− Food cost (COGS)" v={aed(round2(summary.net - summary.profit))} danger />
-            <KV k="= Gross Profit" v={aed(summary.profit)} bold />
-            <KV k="− Expenses" v={aed(expTotal)} danger />
-            <div className="h-px my-1.5" style={{ background: "var(--line)" }} />
-            <KV k="Net Profit" v={aed(netAfterExp)} bold big />
-          </div>
-        </Card>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="p-4 md:p-6 space-y-4">
+      {/* Range selector + Z Report toggle */}
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <div className="flex gap-1.5 p-1 rounded-xl flex-wrap" style={{ background: "var(--surface2)" }}>
+          {[["today", "Today"], ["yesterday", "Yesterday"], ["week", "This Week"], ["month", "This Month"], ["all", "All Time"], ["custom", "Custom"]].map(([k, l]) => (
+            <button key={k} onClick={() => setRange(k)} className="px-3 py-1.5 rounded-lg text-sm font-semibold"
+              style={{ background: range === k ? "var(--surface)" : "transparent", color: range === k ? "var(--purple)" : "var(--muted)", boxShadow: range === k ? "0 1px 4px rgba(0,0,0,0.08)" : "none" }}>{l}</button>
+          ))}
+        </div>
+        <div className="flex gap-2 flex-wrap">
+          <button onClick={() => setShowZReport(!showZReport)} className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-bold"
+            style={{ background: showZReport ? SIDEBAR_GRAD : "var(--surface)", color: showZReport ? "#fff" : "var(--purple)", border: showZReport ? "none" : "1px solid var(--line)" }}>
+            <FileText size={15} /> Z Report
+          </button>
+          <button onClick={exportCSV} className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-semibold" style={{ background: "var(--surface)", color: "var(--ink)", border: "1px solid var(--line)" }}><Download size={15} /> CSV</button>
+          <button onClick={exportExcel} className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm font-bold text-white" style={{ background: SIDEBAR_GRAD }}><FileSpreadsheet size={15} /> Excel</button>
+        </div>
       </div>
 
-      <Card pad="p-0">
-        <CardHead title="Item-wise Sales" sub="Quantity & revenue" className="px-4 pt-4" />
-        <div className="overflow-x-auto mt-2">
-          <table className="w-full text-sm">
-            <thead>
-              <tr style={{ color: "var(--muted)", borderBottom: "1px solid var(--line)" }}>
-                <th className="text-left font-semibold px-4 py-3">Item</th>
-                <th className="text-right font-semibold px-4 py-3">Qty Sold</th>
-                <th className="text-right font-semibold px-4 py-3">Revenue (AED)</th>
-              </tr>
-            </thead>
-            <tbody>
-              {itemSales.length === 0 ? <tr><td colSpan={3} className="px-4 py-6 text-center" style={{ color: "var(--muted)" }}>No sales in this range</td></tr>
-                : itemSales.map((i) => (
-                  <tr key={i.name} style={{ borderBottom: "1px solid var(--line)" }} className="menu-row">
-                    <td className="px-4 py-2.5 font-medium" style={{ color: "var(--ink)" }}>{i.name}</td>
-                    <td className="px-4 py-2.5 text-right tnum" style={{ color: "var(--muted)" }}>{i.qty}</td>
-                    <td className="px-4 py-2.5 text-right font-bold tnum" style={{ color: "var(--purple)" }}>{money(i.revenue)}</td>
-                  </tr>
+      {/* Custom date range picker */}
+      {range === "custom" && (
+        <Card pad="p-3 md:p-4">
+          <div className="flex items-end gap-3 flex-wrap">
+            <Field label="From date"><input type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} className="modal-input" /></Field>
+            <Field label="To date"><input type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} className="modal-input" /></Field>
+            <div className="text-xs py-2" style={{ color: "var(--muted)" }}>{data.length} orders found · {done.length} completed</div>
+          </div>
+        </Card>
+      )}
+
+      {showZReport ? <ZReportView /> : (
+        <>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+            <Stat label="Gross Sales" value={aed(summary.sales)} color="#6D28D9" Icon={TrendingUp} />
+            <Stat label="Net Sales" value={aed(summary.net)} color="#9B7CF6" Icon={Wallet} />
+            <Stat label="VAT (5%)" value={aed(summary.vat)} color="#C19A2B" Icon={FileText} />
+            <Stat label="Gross Profit" value={aed(summary.profit)} color="#1F9D6B" Icon={Coins} />
+            <Stat label="Expenses" value={aed(expTotal)} color="#E6553A" Icon={ReceiptIcon} />
+            <Stat label="Net Profit" value={aed(netAfterExp)} color="#1F9D6B" Icon={TrendingUp} />
+            <Stat label="Discounts" value={aed(summary.disc)} color="#C19A2B" Icon={Percent} />
+            <Stat label="Orders" value={summary.count} color="#6D28D9" Icon={ClipboardList} />
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <Card>
+              <CardHead title="Sales by Category" sub="Revenue (AED)" />
+              <div className="mt-3 space-y-2.5">
+                {byCat.length === 0 ? <Empty msg="No data" /> : byCat.map((c) => {
+                  const pct = Math.round((c.value / byCat[0].value) * 100);
+                  return (
+                    <div key={c.category}>
+                      <div className="flex justify-between text-sm mb-1"><span style={{ color: "var(--ink)" }}>{c.category}</span><span className="font-bold tnum" style={{ color: "var(--purple)" }}>{money(c.value)}</span></div>
+                      <div className="h-2 rounded-full overflow-hidden" style={{ background: "var(--surface2)" }}>
+                        <div className="h-full rounded-full" style={{ width: `${pct}%`, background: GOLD_GRAD }} />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </Card>
+            <Card>
+              <CardHead title="Payment Method Report" sub="Collections (AED)" />
+              <div className="mt-3 space-y-3">
+                {byPay.length === 0 ? <Empty msg="No data" /> : byPay.map((p) => (
+                  <div key={p.method} className="flex items-center justify-between p-3 rounded-xl" style={{ background: "var(--surface2)" }}>
+                    <div className="flex items-center gap-2">
+                      {p.method === "Cash" ? <Banknote size={18} style={{ color: "var(--purple)" }} /> : p.method === "Card" ? <CreditCard size={18} style={{ color: "var(--purple)" }} /> : <Smartphone size={18} style={{ color: "var(--purple)" }} />}
+                      <span className="font-medium" style={{ color: "var(--ink)" }}>{p.method}</span>
+                    </div>
+                    <span className="font-bold tnum" style={{ color: "var(--ink)" }}>{aed(p.value)}</span>
+                  </div>
                 ))}
-            </tbody>
-          </table>
-        </div>
-      </Card>
+              </div>
+            </Card>
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <Card>
+              <CardHead title="Expenses by Category" sub={`Total ${aed(expTotal)}`} />
+              <div className="mt-3 space-y-2.5">
+                {expByCat.length === 0 ? <Empty msg="No expenses in range" /> : expByCat.map((c) => {
+                  const pct = expByCat[0].value ? Math.round((c.value / expByCat[0].value) * 100) : 0;
+                  return (
+                    <div key={c.category}>
+                      <div className="flex justify-between text-sm mb-1"><span style={{ color: "var(--ink)" }}>{c.category}</span><span className="font-bold tnum" style={{ color: "#E6553A" }}>{money(c.value)}</span></div>
+                      <div className="h-2 rounded-full overflow-hidden" style={{ background: "var(--surface2)" }}>
+                        <div className="h-full rounded-full" style={{ width: `${pct}%`, background: "linear-gradient(90deg,#E6553A,#C1402B)" }} />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </Card>
+            <Card>
+              <CardHead title="Profit Summary" sub="After food cost & expenses" />
+              <div className="mt-3 space-y-2.5 text-sm">
+                <KV k="Net Sales (excl. VAT)" v={aed(summary.net)} />
+                <KV k="− Food cost (COGS)" v={aed(round2(summary.net - summary.profit))} danger />
+                <KV k="= Gross Profit" v={aed(summary.profit)} bold />
+                <KV k="− Expenses" v={aed(expTotal)} danger />
+                <div className="h-px my-1.5" style={{ background: "var(--line)" }} />
+                <KV k="Net Profit" v={aed(netAfterExp)} bold big />
+              </div>
+            </Card>
+          </div>
+
+          <Card pad="p-0">
+            <CardHead title="Item-wise Sales" sub="Quantity & revenue" className="px-4 pt-4" />
+            <div className="overflow-x-auto mt-2">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr style={{ color: "var(--muted)", borderBottom: "1px solid var(--line)" }}>
+                    <th className="text-left font-semibold px-4 py-3">Item</th>
+                    <th className="text-right font-semibold px-4 py-3">Qty Sold</th>
+                    <th className="text-right font-semibold px-4 py-3">Revenue (AED)</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {itemSales.length === 0 ? <tr><td colSpan={3} className="px-4 py-6 text-center" style={{ color: "var(--muted)" }}>No sales in this range</td></tr>
+                    : itemSales.map((i) => (
+                      <tr key={i.name} style={{ borderBottom: "1px solid var(--line)" }} className="menu-row">
+                        <td className="px-4 py-2.5 font-medium" style={{ color: "var(--ink)" }}>{i.name}</td>
+                        <td className="px-4 py-2.5 text-right tnum" style={{ color: "var(--muted)" }}>{i.qty}</td>
+                        <td className="px-4 py-2.5 text-right font-bold tnum" style={{ color: "var(--purple)" }}>{money(i.revenue)}</td>
+                      </tr>
+                    ))}
+                </tbody>
+              </table>
+            </div>
+          </Card>
+        </>
+      )}
     </div>
   );
 }
