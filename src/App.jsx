@@ -339,34 +339,47 @@ export default function App() {
   const [staff, setStaff] = useState(INITIAL_STAFF);
   const [storageReady, setStorageReady] = useState(false);
 
+  // Helper: safe read from storage (returns null if key missing)
+  const safeGet = async (key) => {
+    try { const r = await window.storage.get(key); return r && r.value ? r.value : null; } catch(e) { return null; }
+  };
+  // Helper: safe write to storage
+  const safeSet = async (key, val) => {
+    try { await window.storage.set(key, val); } catch(e) { console.warn("Storage write failed:", key, e); }
+  };
+
   // ---- Persistent storage: load on mount ----
   useEffect(() => {
     (async () => {
-      try {
-        const staffRes = await window.storage.get("chai_staff");
-        if (staffRes && staffRes.value) { const p = JSON.parse(staffRes.value); if (Array.isArray(p) && p.length > 0) setStaff(p); }
-        const ordersRes = await window.storage.get("chai_orders");
-        if (ordersRes && ordersRes.value) { const p = JSON.parse(ordersRes.value); if (Array.isArray(p)) setOrders(p); }
-        const expRes = await window.storage.get("chai_expenses");
-        if (expRes && expRes.value) { const p = JSON.parse(expRes.value); if (Array.isArray(p)) setExpenses(p); }
-        const invRes = await window.storage.get("chai_inventory");
-        if (invRes && invRes.value) { const p = JSON.parse(invRes.value); if (Array.isArray(p)) setInventory(p); }
-        const restRes = await window.storage.get("chai_restaurant");
-        if (restRes && restRes.value) { const p = JSON.parse(restRes.value); if (p && typeof p === "object") setRestaurant(p); }
-        const menuRes = await window.storage.get("chai_menu");
-        if (menuRes && menuRes.value) { const p = JSON.parse(menuRes.value); if (Array.isArray(p) && p.length > 0) setItems(p); }
-      } catch (e) { console.log("Storage load (first run):", e); }
+      const raw_staff = await safeGet("chai_staff");
+      if (raw_staff) { try { const p = JSON.parse(raw_staff); if (Array.isArray(p) && p.length > 0) setStaff(p); } catch(e){} }
+
+      const raw_orders = await safeGet("chai_orders");
+      if (raw_orders) { try { const p = JSON.parse(raw_orders); if (Array.isArray(p)) setOrders(p); } catch(e){} }
+
+      const raw_exp = await safeGet("chai_expenses");
+      if (raw_exp) { try { const p = JSON.parse(raw_exp); if (Array.isArray(p)) setExpenses(p); } catch(e){} }
+
+      const raw_inv = await safeGet("chai_inventory");
+      if (raw_inv) { try { const p = JSON.parse(raw_inv); if (Array.isArray(p)) setInventory(p); } catch(e){} }
+
+      const raw_rest = await safeGet("chai_restaurant");
+      if (raw_rest) { try { const p = JSON.parse(raw_rest); if (p && typeof p === "object") setRestaurant(p); } catch(e){} }
+
+      const raw_menu = await safeGet("chai_menu");
+      if (raw_menu) { try { const p = JSON.parse(raw_menu); if (Array.isArray(p) && p.length > 0) setItems(p); } catch(e){} }
+
       setStorageReady(true);
     })();
   }, []);
 
   // ---- Persist on change (only after initial load) ----
-  useEffect(() => { if (storageReady) { try { window.storage.set("chai_staff", JSON.stringify(staff)); } catch(e){} } }, [staff, storageReady]);
-  useEffect(() => { if (storageReady) { try { window.storage.set("chai_orders", JSON.stringify(orders)); } catch(e){} } }, [orders, storageReady]);
-  useEffect(() => { if (storageReady) { try { window.storage.set("chai_expenses", JSON.stringify(expenses)); } catch(e){} } }, [expenses, storageReady]);
-  useEffect(() => { if (storageReady) { try { window.storage.set("chai_inventory", JSON.stringify(inventory)); } catch(e){} } }, [inventory, storageReady]);
-  useEffect(() => { if (storageReady) { try { window.storage.set("chai_restaurant", JSON.stringify(restaurant)); } catch(e){} } }, [restaurant, storageReady]);
-  useEffect(() => { if (storageReady) { try { window.storage.set("chai_menu", JSON.stringify(items)); } catch(e){} } }, [items, storageReady]);
+  useEffect(() => { if (storageReady) safeSet("chai_staff", JSON.stringify(staff)); }, [staff, storageReady]);
+  useEffect(() => { if (storageReady) safeSet("chai_orders", JSON.stringify(orders)); }, [orders, storageReady]);
+  useEffect(() => { if (storageReady) safeSet("chai_expenses", JSON.stringify(expenses)); }, [expenses, storageReady]);
+  useEffect(() => { if (storageReady) safeSet("chai_inventory", JSON.stringify(inventory)); }, [inventory, storageReady]);
+  useEffect(() => { if (storageReady) safeSet("chai_restaurant", JSON.stringify(restaurant)); }, [restaurant, storageReady]);
+  useEffect(() => { if (storageReady) safeSet("chai_menu", JSON.stringify(items)); }, [items, storageReady]);
 
   // POS cart
   const [lines, setLines] = useState([]);
@@ -527,7 +540,7 @@ export default function App() {
 
   function resetDemo() {
     setOrders([]); setExpenses([]); setHeld([]); clearCart();
-    try { window.storage.set("chai_orders", "[]"); window.storage.set("chai_expenses", "[]"); } catch(e){}
+    safeSet("chai_orders", "[]"); safeSet("chai_expenses", "[]");
     flash("Sales & expenses cleared");
   }
 
@@ -1898,109 +1911,87 @@ function Reports({ orders, todays, items, restaurant, expenses = [] }) {
   }
 
   function printZReport() {
-    const dtStr = new Date().toLocaleDateString("en-GB", { weekday: "short", day: "2-digit", month: "short", year: "numeric" });
-    const timeStr = new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+    const dtStr = new Date().toLocaleDateString("en-GB") + " " + new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
     const rangeLabel = range === "today" ? "Today" : range === "yesterday" ? "Yesterday" : range === "week" ? "This Week" : range === "month" ? "This Month" : range === "custom" ? `${dateFrom || ""} to ${dateTo || todayStr()}` : "All Time";
     const esc = (s) => String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-    const row = (l, r, o = {}) => `<div style="display:flex;justify-content:space-between;${o.bold ? "font-weight:700;" : ""}${o.big ? "font-size:13px;" : ""}${o.top ? "border-top:1px solid #000;padding-top:3px;margin-top:2px;" : ""}">${typeof l === "string" ? `<span>${l}</span>` : l}<span style="white-space:nowrap;text-align:right;">${r}</span></div>`;
-    const dv = `<div style="border-top:1px dashed #000;margin:5px 0;"></div>`;
-    const hd = (t) => `<div style="text-align:center;font-weight:700;font-size:11px;border-top:1px dashed #000;border-bottom:1px dashed #000;padding:3px 0;margin:6px 0;">${t}</div>`;
+    // Same bilingual row helper as the product bill
+    const bi = (en, ar, val, o = {}) =>
+      `<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;${o.bold ? "font-weight:700;" : ""}${o.top ? "border-top:1px solid #000;padding-top:4px;margin-top:2px;" : ""}"><span style="line-height:1.15;">${en}${ar ? `<br><span dir="rtl" style="font-size:8px;color:#000;">${ar}</span>` : ""}</span><span style="white-space:nowrap;text-align:right;">${val}</span></div>`;
+    const totalItems = done.reduce((s, o) => s + o.totals.itemCount, 0);
 
-    // Category rows
+    // Category item rows
     let catRows = "";
     byCatDetailed.forEach((c) => {
       const catEmoji = CATEGORIES.find((x) => x.name === c.category)?.emoji || "";
-      catRows += `<div style="font-weight:700;font-size:11px;margin-top:4px;padding:2px 0;border-bottom:1px dotted #999;">${catEmoji} ${esc(c.category)} <span style="float:right;">${money(c.revenue)}</span></div>`;
+      catRows += `<div style="display:flex;justify-content:space-between;font-weight:700;padding:3px 0 1px;border-bottom:1px dotted #999;"><span>${catEmoji} ${esc(c.category)}</span><span>${money(c.revenue)}</span></div>`;
       c.items.forEach((i) => {
-        catRows += `<div style="display:flex;justify-content:space-between;padding:1px 0 1px 8px;font-size:10px;"><span>${esc(i.name)} x${i.qty}</span><span>${money(i.revenue)}</span></div>`;
+        catRows += `<div style="display:flex;justify-content:space-between;padding:1px 0 1px 8px;"><span>${i.qty} &times; ${esc(i.name)}</span><span>${money(i.revenue)}</span></div>`;
       });
     });
 
-    // Payment rows
-    let payRows = byPay.map((p) => row(esc(p.method), `AED ${money(p.value)}`)).join("");
-    // Order type rows
-    let typeRows = byType.map((t) => row(`${esc(t.type)} (${t.count})`, `AED ${money(t.revenue)}`)).join("");
-    // Cashier rows
-    let cashierRows = byCashier.map((c) => row(`${esc(c.name)} (${c.count})`, `AED ${money(c.revenue)}`)).join("");
-    // Hourly rows
-    let hourRows = hourly.map((h) => row(`${h.hour} (${h.orders})`, `${money(h.revenue)}`)).join("");
-    // Expense rows
-    let expRows = expByCat.map((c) => row(esc(c.category), `${money(c.value)}`)).join("");
-
-    const totalItems = done.reduce((s, o) => s + o.totals.itemCount, 0);
-
-    const html = `<!doctype html><html><head><meta charset="utf-8"><title>Z Report</title>`
-      + `<style>@page{size:80mm auto;margin:3mm}*{box-sizing:border-box}body{font-family:'Courier New',monospace;color:#000;width:74mm;margin:0 auto;font-size:11px;line-height:1.4}img.logo{width:50px;height:auto;display:block;margin:0 auto 3px}</style></head><body>`
-      // Header
-      + `<div style="text-align:center;"><img class="logo" src="${LOGO_MONO}" alt=""/>`
-      + `<div style="font-weight:700;font-size:13px;">${esc(restaurant.name)}</div>`
-      + `<div dir="rtl" style="font-size:11px;">${esc(restaurant.arabicName)}</div>`
-      + `<div style="font-size:9px;">${esc(restaurant.address1)}<br>${esc(restaurant.address2)}</div>`
-      + `<div style="font-size:9px;">Tel: ${esc(restaurant.phone1)}</div>`
-      + `<div style="font-size:9px;font-weight:700;">VAT: ${esc(restaurant.vat)}</div></div>`
-      // Z Report title
-      + `<div style="border-top:2px solid #000;border-bottom:2px solid #000;text-align:center;font-weight:700;font-size:14px;margin:6px 0;padding:4px 0;">Z REPORT<br><span style="font-size:10px;font-weight:400;">تقرير نهاية اليوم</span></div>`
-      + `<div style="display:flex;justify-content:space-between;font-size:10px;"><span>${esc(rangeLabel)}</span><span>${dtStr} ${timeStr}</span></div>`
-      + dv
-      // Grand summary
-      + row("GROSS SALES", `AED ${money(summary.sales)}`, { bold: true, big: true })
-      + row("Net Sales (excl VAT)", `AED ${money(summary.net)}`)
-      + row("VAT 5% Collected", `AED ${money(summary.vat)}`)
-      + row("Total Orders", `${summary.count}`)
-      + row("Cancelled", `${summary.cancelled}`)
-      + row("Total Items Sold", `${totalItems}`)
-      + row("Avg Order Value", `AED ${money(summary.count ? summary.sales / summary.count : 0)}`)
-      + row("Discounts Given", `AED ${money(summary.disc)}`)
-      + dv
-      // Category breakdown
-      + hd("SALES BY CATEGORY / حسب الفئة")
-      + (byCatDetailed.length === 0 ? `<div style="text-align:center;font-size:10px;color:#999;padding:4px;">No sales</div>` : catRows)
-      + `<div style="border-top:1px solid #000;margin-top:3px;padding-top:2px;">`
-      + row("TOTAL", `AED ${money(summary.sales)}`, { bold: true })
-      + `</div>`
-      + dv
+    // Build HTML — exact same CSS & structure as product bill receipt
+    const html =
+      `<!doctype html><html><head><meta charset="utf-8"><title>Z Report</title><style>@page{size:80mm auto;margin:3mm}*{box-sizing:border-box}body{font-family:'Courier New',monospace;color:#000;width:74mm;margin:0 auto;font-size:12px;line-height:1.35}.c{text-align:center}.dv{border-top:1px dashed #000;margin:6px 0}img.logo{width:58px;height:auto;display:block;margin:0 auto 4px}</style></head><body>` +
+      // Header — identical to product bill
+      `<div class="c"><img class="logo" src="${LOGO_MONO}" alt=""/><div style="font-weight:700;font-size:14px;">${esc(restaurant.name)}</div><div dir="rtl" style="font-size:12px;">${esc(restaurant.arabicName)}</div><div style="font-size:10px;">${esc(restaurant.address1)}<br>${esc(restaurant.address2)}</div><div style="font-size:10px;">Tel/&#1607;&#1575;&#1578;&#1601;: ${esc(restaurant.phone1)}</div><div style="font-size:10px;font-weight:700;">VAT/&#1575;&#1604;&#1585;&#1602;&#1605; &#1575;&#1604;&#1590;&#1585;&#1610;&#1576;&#1610;: ${esc(restaurant.vat)}</div></div>` +
+      // Title — same dashed border style as receipt header
+      `<div style="border-top:1px dashed #000;border-bottom:1px dashed #000;text-align:center;font-weight:700;margin:6px 0;padding:3px 0;">Z REPORT &bull; &#1578;&#1602;&#1585;&#1610;&#1585; &#1606;&#1607;&#1575;&#1610;&#1577; &#1575;&#1604;&#1610;&#1608;&#1605;</div>` +
+      `<div style="display:flex;justify-content:space-between;"><span>Period: <b>${esc(rangeLabel)}</b></span><span>${dtStr}</span></div>` +
+      `<div class="dv"></div>` +
+      // Summary section
+      `<div style="display:flex;justify-content:space-between;font-weight:700;font-size:10px;"><span>SUMMARY</span><span>&#1605;&#1604;&#1582;&#1589;</span></div>` +
+      bi("Gross Sales", "&#1573;&#1580;&#1605;&#1575;&#1604;&#1610; &#1575;&#1604;&#1605;&#1576;&#1610;&#1593;&#1575;&#1578;", `AED ${money(summary.sales)}`, { bold: true }) +
+      bi("Net Sales", "&#1589;&#1575;&#1601;&#1610; &#1575;&#1604;&#1605;&#1576;&#1610;&#1593;&#1575;&#1578;", `AED ${money(summary.net)}`) +
+      bi("VAT 5%", "&#1590;&#1585;&#1610;&#1576;&#1577; &#1575;&#1604;&#1602;&#1610;&#1605;&#1577; &#1575;&#1604;&#1605;&#1590;&#1575;&#1601;&#1577;", `AED ${money(summary.vat)}`) +
+      bi("Total Orders", "&#1573;&#1580;&#1605;&#1575;&#1604;&#1610; &#1575;&#1604;&#1591;&#1604;&#1576;&#1575;&#1578;", `${summary.count}`) +
+      bi("Cancelled", "&#1605;&#1604;&#1594;&#1575;&#1577;", `${summary.cancelled}`) +
+      bi("Items Sold", "&#1575;&#1604;&#1571;&#1589;&#1606;&#1575;&#1601; &#1575;&#1604;&#1605;&#1576;&#1575;&#1593;&#1577;", `${totalItems}`) +
+      bi("Avg Order", "&#1605;&#1578;&#1608;&#1587;&#1591; &#1575;&#1604;&#1591;&#1604;&#1576;", `AED ${money(summary.count ? summary.sales / summary.count : 0)}`) +
+      bi("Discounts", "&#1575;&#1604;&#1582;&#1589;&#1608;&#1605;&#1575;&#1578;", `AED ${money(summary.disc)}`) +
+      `<div class="dv"></div>` +
+      // Sales by category
+      `<div style="border-top:1px dashed #000;border-bottom:1px dashed #000;text-align:center;font-weight:700;margin:6px 0;padding:3px 0;">SALES BY CATEGORY &bull; &#1581;&#1587;&#1576; &#1575;&#1604;&#1601;&#1574;&#1577;</div>` +
+      `<div style="display:flex;justify-content:space-between;font-weight:700;font-size:10px;margin-bottom:2px;"><span>CATEGORY / ITEM</span><span>TOTAL</span></div>` +
+      (byCatDetailed.length === 0 ? `<div class="c" style="padding:4px;color:#666;">No sales</div>` : catRows) +
+      bi("TOTAL", "&#1575;&#1604;&#1605;&#1580;&#1605;&#1608;&#1593;", `AED ${money(summary.sales)}`, { bold: true, top: true }) +
+      `<div class="dv"></div>` +
       // Payment methods
-      + hd("PAYMENT METHODS / طرق الدفع")
-      + payRows
-      + row("TOTAL", `AED ${money(summary.sales)}`, { bold: true, top: true })
-      + dv
+      `<div style="border-top:1px dashed #000;border-bottom:1px dashed #000;text-align:center;font-weight:700;margin:6px 0;padding:3px 0;">PAYMENT METHODS &bull; &#1591;&#1585;&#1602; &#1575;&#1604;&#1583;&#1601;&#1593;</div>` +
+      byPay.map((p) => bi(p.method, "", `AED ${money(p.value)}`)).join("") +
+      bi("TOTAL", "&#1575;&#1604;&#1605;&#1580;&#1605;&#1608;&#1593;", `AED ${money(summary.sales)}`, { bold: true, top: true }) +
+      `<div class="dv"></div>` +
       // Order types
-      + hd("ORDER TYPES / أنواع الطلبات")
-      + typeRows
-      + dv
-      // Cashier summary
-      + hd("CASHIER SUMMARY / ملخص الكاشير")
-      + cashierRows
-      + dv
-      // Hourly breakdown
-      + hd("HOURLY SALES / المبيعات بالساعة")
-      + hourRows
-      + dv
-      // Profit & Loss
-      + hd("PROFIT & LOSS / الربح والخسارة")
-      + row("Gross Sales", `${money(summary.sales)}`)
-      + row("− VAT (5%)", `− ${money(summary.vat)}`)
-      + row("Net Sales", `${money(summary.net)}`, { bold: true })
-      + row("− Food Cost", `− ${money(round2(summary.net - summary.profit))}`)
-      + row("Gross Profit", `${money(summary.profit)}`, { bold: true })
-      + row("− Expenses", `− ${money(expTotal)}`)
-      + `<div style="border-top:2px solid #000;margin-top:3px;padding-top:3px;">`
-      + row("NET PROFIT", `AED ${money(Math.abs(netAfterExp))}`, { bold: true, big: true })
-      + `<div style="text-align:center;font-size:10px;font-weight:700;">${netAfterExp >= 0 ? "✓ IN PROFIT" : "✗ IN LOSS"}</div></div>`
-      + dv
-      // Expenses
-      + hd("EXPENSES / المصروفات")
-      + (expByCat.length === 0 ? `<div style="text-align:center;font-size:10px;color:#999;padding:4px;">No expenses</div>` : expRows)
-      + row("TOTAL EXPENSES", `AED ${money(expTotal)}`, { bold: true, top: true })
-      + dv
-      // Footer
-      + `<div style="text-align:center;font-size:9px;margin-top:6px;">`
-      + `<div style="font-weight:700;">— End of Z Report —</div>`
-      + `<div>— نهاية التقرير —</div>`
-      + `<div style="margin-top:3px;color:#666;">Printed: ${new Date().toLocaleString("en-GB")}</div>`
-      + `<div style="color:#666;">${esc(restaurant.name)}</div>`
-      + `</div></body></html>`;
+      `<div style="border-top:1px dashed #000;border-bottom:1px dashed #000;text-align:center;font-weight:700;margin:6px 0;padding:3px 0;">ORDER TYPES &bull; &#1571;&#1606;&#1608;&#1575;&#1593; &#1575;&#1604;&#1591;&#1604;&#1576;&#1575;&#1578;</div>` +
+      byType.map((t) => bi(`${t.type} (${t.count})`, "", `AED ${money(t.revenue)}`)).join("") +
+      `<div class="dv"></div>` +
+      // Cashier
+      `<div style="border-top:1px dashed #000;border-bottom:1px dashed #000;text-align:center;font-weight:700;margin:6px 0;padding:3px 0;">CASHIER &bull; &#1575;&#1604;&#1603;&#1575;&#1588;&#1610;&#1585;</div>` +
+      byCashier.map((c) => bi(`${c.name} (${c.count})`, "", `AED ${money(c.revenue)}`)).join("") +
+      `<div class="dv"></div>` +
+      // Hourly
+      `<div style="border-top:1px dashed #000;border-bottom:1px dashed #000;text-align:center;font-weight:700;margin:6px 0;padding:3px 0;">HOURLY SALES &bull; &#1575;&#1604;&#1605;&#1576;&#1610;&#1593;&#1575;&#1578; &#1576;&#1575;&#1604;&#1587;&#1575;&#1593;&#1577;</div>` +
+      `<div style="display:flex;justify-content:space-between;font-weight:700;font-size:10px;"><span>HOUR</span><span>ORDERS</span><span>TOTAL</span></div>` +
+      hourly.map((h) => `<div style="display:flex;justify-content:space-between;padding:1px 0;"><span>${h.hour}</span><span>${h.orders}</span><span>${money(h.revenue)}</span></div>`).join("") +
+      `<div class="dv"></div>` +
+      // P&L
+      `<div style="border-top:1px dashed #000;border-bottom:1px dashed #000;text-align:center;font-weight:700;margin:6px 0;padding:3px 0;">PROFIT &amp; LOSS &bull; &#1575;&#1604;&#1585;&#1576;&#1581; &#1608;&#1575;&#1604;&#1582;&#1587;&#1575;&#1585;&#1577;</div>` +
+      bi("Gross Sales", "&#1573;&#1580;&#1605;&#1575;&#1604;&#1610; &#1575;&#1604;&#1605;&#1576;&#1610;&#1593;&#1575;&#1578;", `${money(summary.sales)}`) +
+      bi("&minus; VAT (5%)", "&#1590;&#1585;&#1610;&#1576;&#1577; &#1575;&#1604;&#1602;&#1610;&#1605;&#1577; &#1575;&#1604;&#1605;&#1590;&#1575;&#1601;&#1577;", `&minus; ${money(summary.vat)}`) +
+      bi("Net Sales", "&#1589;&#1575;&#1601;&#1610; &#1575;&#1604;&#1605;&#1576;&#1610;&#1593;&#1575;&#1578;", `${money(summary.net)}`, { bold: true }) +
+      bi("&minus; Food Cost", "&#1578;&#1603;&#1604;&#1601;&#1577; &#1575;&#1604;&#1591;&#1593;&#1575;&#1605;", `&minus; ${money(round2(summary.net - summary.profit))}`) +
+      bi("Gross Profit", "&#1573;&#1580;&#1605;&#1575;&#1604;&#1610; &#1575;&#1604;&#1585;&#1576;&#1581;", `${money(summary.profit)}`, { bold: true }) +
+      bi("&minus; Expenses", "&#1575;&#1604;&#1605;&#1589;&#1585;&#1608;&#1601;&#1575;&#1578;", `&minus; ${money(expTotal)}`) +
+      bi("NET PROFIT", "&#1589;&#1575;&#1601;&#1610; &#1575;&#1604;&#1585;&#1576;&#1581;", `AED ${money(Math.abs(netAfterExp))}`, { bold: true, top: true }) +
+      `<div class="dv"></div>` +
+      // Expenses by category
+      `<div style="border-top:1px dashed #000;border-bottom:1px dashed #000;text-align:center;font-weight:700;margin:6px 0;padding:3px 0;">EXPENSES &bull; &#1575;&#1604;&#1605;&#1589;&#1585;&#1608;&#1601;&#1575;&#1578;</div>` +
+      (expByCat.length === 0 ? `<div class="c" style="padding:4px;color:#666;">No expenses</div>` : expByCat.map((c) => bi(c.category, "", `${money(c.value)}`)).join("")) +
+      bi("TOTAL EXPENSES", "&#1573;&#1580;&#1605;&#1575;&#1604;&#1610; &#1575;&#1604;&#1605;&#1589;&#1585;&#1608;&#1601;&#1575;&#1578;", `AED ${money(expTotal)}`, { bold: true, top: true }) +
+      `<div class="dv"></div>` +
+      // Footer — same style as product bill footer
+      `<div class="c" style="margin-top:10px;"><div style="font-weight:700;">— End of Z Report —</div><div dir="rtl">— &#1606;&#1607;&#1575;&#1610;&#1577; &#1575;&#1604;&#1578;&#1602;&#1585;&#1610;&#1585; —</div><div style="font-weight:700;margin-top:4px;">${esc(restaurant.receiptFooter)}</div></div></body></html>`;
 
+    // Print via iframe — same method as product bill
     const frame = document.createElement("iframe");
     frame.setAttribute("aria-hidden", "true");
     frame.style.cssText = "position:fixed;right:0;bottom:0;width:0;height:0;border:0;";
