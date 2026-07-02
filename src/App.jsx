@@ -1898,39 +1898,122 @@ function Reports({ orders, todays, items, restaurant, expenses = [] }) {
   }
 
   function printZReport() {
-    const dtStr = new Date().toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long", year: "numeric" });
+    const dtStr = new Date().toLocaleDateString("en-GB", { weekday: "short", day: "2-digit", month: "short", year: "numeric" });
+    const timeStr = new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
     const rangeLabel = range === "today" ? "Today" : range === "yesterday" ? "Yesterday" : range === "week" ? "This Week" : range === "month" ? "This Month" : range === "custom" ? `${dateFrom || ""} to ${dateTo || todayStr()}` : "All Time";
     const esc = (s) => String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-    let catHtml = "";
+    const row = (l, r, o = {}) => `<div style="display:flex;justify-content:space-between;${o.bold ? "font-weight:700;" : ""}${o.big ? "font-size:13px;" : ""}${o.top ? "border-top:1px solid #000;padding-top:3px;margin-top:2px;" : ""}">${typeof l === "string" ? `<span>${l}</span>` : l}<span style="white-space:nowrap;text-align:right;">${r}</span></div>`;
+    const dv = `<div style="border-top:1px dashed #000;margin:5px 0;"></div>`;
+    const hd = (t) => `<div style="text-align:center;font-weight:700;font-size:11px;border-top:1px dashed #000;border-bottom:1px dashed #000;padding:3px 0;margin:6px 0;">${t}</div>`;
+
+    // Category rows
+    let catRows = "";
     byCatDetailed.forEach((c) => {
-      catHtml += `<tr style="background:#f5f3ff;font-weight:700;"><td colspan="2" style="padding:4px 8px;">${esc(c.category)}</td><td style="text-align:right;padding:4px 8px;">${c.qty}</td><td style="text-align:right;padding:4px 8px;">${money(c.revenue)}</td></tr>`;
+      const catEmoji = CATEGORIES.find((x) => x.name === c.category)?.emoji || "";
+      catRows += `<div style="font-weight:700;font-size:11px;margin-top:4px;padding:2px 0;border-bottom:1px dotted #999;">${catEmoji} ${esc(c.category)} <span style="float:right;">${money(c.revenue)}</span></div>`;
       c.items.forEach((i) => {
-        catHtml += `<tr><td style="padding:2px 8px 2px 24px;" colspan="2">${esc(i.name)}</td><td style="text-align:right;padding:2px 8px;">${i.qty}</td><td style="text-align:right;padding:2px 8px;">${money(i.revenue)}</td></tr>`;
+        catRows += `<div style="display:flex;justify-content:space-between;padding:1px 0 1px 8px;font-size:10px;"><span>${esc(i.name)} x${i.qty}</span><span>${money(i.revenue)}</span></div>`;
       });
     });
-    let payHtml = byPay.map((p) => `<tr><td style="padding:3px 8px;">${esc(p.method)}</td><td style="text-align:right;padding:3px 8px;">${money(p.value)}</td></tr>`).join("");
-    let typeHtml = byType.map((t) => `<tr><td style="padding:3px 8px;">${esc(t.type)}</td><td style="text-align:right;padding:3px 8px;">${t.count}</td><td style="text-align:right;padding:3px 8px;">${money(t.revenue)}</td></tr>`).join("");
-    let cashierHtml = byCashier.map((c) => `<tr><td style="padding:3px 8px;">${esc(c.name)}</td><td style="text-align:right;padding:3px 8px;">${c.count}</td><td style="text-align:right;padding:3px 8px;">${money(c.revenue)}</td></tr>`).join("");
-    let hourHtml = hourly.map((h) => `<tr><td style="padding:2px 8px;">${h.hour}</td><td style="text-align:right;padding:2px 8px;">${h.orders}</td><td style="text-align:right;padding:2px 8px;">${money(h.revenue)}</td></tr>`).join("");
-    let expHtml = expByCat.map((c) => `<tr><td style="padding:3px 8px;">${esc(c.category)}</td><td style="text-align:right;padding:3px 8px;">${money(c.value)}</td></tr>`).join("");
 
-    const html = `<!doctype html><html><head><meta charset="utf-8"><title>Z Report</title><style>@page{margin:10mm}*{box-sizing:border-box}body{font-family:Arial,sans-serif;color:#1a1a1a;font-size:11px;max-width:700px;margin:0 auto}h1{font-size:18px;margin:0}h2{font-size:13px;margin:16px 0 6px;padding:4px 8px;background:#2E1065;color:#fff;border-radius:4px}table{width:100%;border-collapse:collapse;margin-bottom:8px}th{text-align:left;padding:4px 8px;border-bottom:2px solid #2E1065;font-size:10px;text-transform:uppercase;color:#6D28D9}td{border-bottom:1px solid #eee}.hdr{display:flex;justify-content:space-between;align-items:center;border-bottom:3px double #2E1065;padding-bottom:10px;margin-bottom:10px}.sumr{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:10px}.sumr div{padding:6px 10px;background:#faf8ff;border:1px solid #ece8f7;border-radius:6px}.sumr .lbl{font-size:10px;color:#736C90}.sumr .val{font-size:14px;font-weight:700}</style></head><body>`
-      + `<div class="hdr"><div><h1>${esc(restaurant.name)}</h1><div style="font-size:12px;color:#736C90;">Z REPORT — End of Day Summary</div></div><div style="text-align:right"><div style="font-size:12px;font-weight:700;">${esc(rangeLabel)}</div><div style="font-size:10px;color:#736C90">${dtStr}</div><div style="font-size:9px;color:#999">VAT: ${esc(restaurant.vat)}</div></div></div>`
-      + `<div class="sumr"><div><div class="lbl">Gross Sales</div><div class="val">AED ${money(summary.sales)}</div></div><div><div class="lbl">Net Sales</div><div class="val">AED ${money(summary.net)}</div></div><div><div class="lbl">VAT Collected</div><div class="val">AED ${money(summary.vat)}</div></div><div><div class="lbl">Net Profit</div><div class="val" style="color:${netAfterExp >= 0 ? '#1F9D6B' : '#E6553A'}">AED ${money(netAfterExp)}</div></div><div><div class="lbl">Orders</div><div class="val">${summary.count}</div></div><div><div class="lbl">Cancelled</div><div class="val">${summary.cancelled}</div></div></div>`
-      + `<h2>Sales by Category (All ${CATEGORIES.length} Categories)</h2><table><tr><th colspan="2">Category / Item</th><th style="text-align:right">Qty</th><th style="text-align:right">Revenue</th></tr>${catHtml}${byCatDetailed.length === 0 ? '<tr><td colspan="4" style="text-align:center;padding:8px;color:#999">No sales data</td></tr>' : ''}<tr style="font-weight:700;border-top:2px solid #2E1065"><td colspan="2" style="padding:4px 8px">TOTAL</td><td style="text-align:right;padding:4px 8px">${done.reduce((s,o) => s + o.totals.itemCount, 0)}</td><td style="text-align:right;padding:4px 8px">${money(summary.sales)}</td></tr></table>`
-      + `<h2>Payment Methods</h2><table><tr><th>Method</th><th style="text-align:right">Amount (AED)</th></tr>${payHtml}<tr style="font-weight:700;border-top:2px solid #2E1065"><td style="padding:4px 8px">TOTAL</td><td style="text-align:right;padding:4px 8px">${money(summary.sales)}</td></tr></table>`
-      + `<h2>Order Types</h2><table><tr><th>Type</th><th style="text-align:right">Orders</th><th style="text-align:right">Revenue</th></tr>${typeHtml}</table>`
-      + `<h2>Cashier Summary</h2><table><tr><th>Cashier</th><th style="text-align:right">Orders</th><th style="text-align:right">Revenue</th></tr>${cashierHtml}</table>`
-      + `<h2>Hourly Breakdown</h2><table><tr><th>Hour</th><th style="text-align:right">Orders</th><th style="text-align:right">Revenue</th></tr>${hourHtml}</table>`
-      + `<h2>Profit & Loss</h2><table><tr><td style="padding:3px 8px">Gross Sales (incl. VAT)</td><td style="text-align:right;padding:3px 8px">${money(summary.sales)}</td></tr><tr><td style="padding:3px 8px">− VAT (5%)</td><td style="text-align:right;padding:3px 8px;color:#E6553A">− ${money(summary.vat)}</td></tr><tr style="font-weight:600"><td style="padding:3px 8px">Net Sales</td><td style="text-align:right;padding:3px 8px">${money(summary.net)}</td></tr><tr><td style="padding:3px 8px">− Food Cost (COGS)</td><td style="text-align:right;padding:3px 8px;color:#E6553A">− ${money(round2(summary.net - summary.profit))}</td></tr><tr style="font-weight:600"><td style="padding:3px 8px">Gross Profit</td><td style="text-align:right;padding:3px 8px">${money(summary.profit)}</td></tr><tr><td style="padding:3px 8px">− Expenses</td><td style="text-align:right;padding:3px 8px;color:#E6553A">− ${money(expTotal)}</td></tr><tr style="font-weight:700;border-top:2px solid #2E1065"><td style="padding:4px 8px">NET PROFIT</td><td style="text-align:right;padding:4px 8px;color:${netAfterExp >= 0 ? '#1F9D6B' : '#E6553A'}">${netAfterExp >= 0 ? '' : '− '}AED ${money(Math.abs(netAfterExp))}</td></tr></table>`
-      + `<h2>Expenses by Category</h2><table><tr><th>Category</th><th style="text-align:right">Amount</th></tr>${expHtml}${expByCat.length === 0 ? '<tr><td colspan="2" style="text-align:center;padding:8px;color:#999">No expenses</td></tr>' : ''}<tr style="font-weight:700;border-top:2px solid #2E1065"><td style="padding:4px 8px">TOTAL EXPENSES</td><td style="text-align:right;padding:4px 8px">${money(expTotal)}</td></tr></table>`
-      + `<div style="text-align:center;margin-top:20px;padding-top:10px;border-top:1px solid #eee;color:#999;font-size:9px">Generated by Chai Al Saadah POS · ${new Date().toLocaleString("en-GB")}</div></body></html>`;
+    // Payment rows
+    let payRows = byPay.map((p) => row(esc(p.method), `AED ${money(p.value)}`)).join("");
+    // Order type rows
+    let typeRows = byType.map((t) => row(`${esc(t.type)} (${t.count})`, `AED ${money(t.revenue)}`)).join("");
+    // Cashier rows
+    let cashierRows = byCashier.map((c) => row(`${esc(c.name)} (${c.count})`, `AED ${money(c.revenue)}`)).join("");
+    // Hourly rows
+    let hourRows = hourly.map((h) => row(`${h.hour} (${h.orders})`, `${money(h.revenue)}`)).join("");
+    // Expense rows
+    let expRows = expByCat.map((c) => row(esc(c.category), `${money(c.value)}`)).join("");
+
+    const totalItems = done.reduce((s, o) => s + o.totals.itemCount, 0);
+
+    const html = `<!doctype html><html><head><meta charset="utf-8"><title>Z Report</title>`
+      + `<style>@page{size:80mm auto;margin:3mm}*{box-sizing:border-box}body{font-family:'Courier New',monospace;color:#000;width:74mm;margin:0 auto;font-size:11px;line-height:1.4}img.logo{width:50px;height:auto;display:block;margin:0 auto 3px}</style></head><body>`
+      // Header
+      + `<div style="text-align:center;"><img class="logo" src="${LOGO_MONO}" alt=""/>`
+      + `<div style="font-weight:700;font-size:13px;">${esc(restaurant.name)}</div>`
+      + `<div dir="rtl" style="font-size:11px;">${esc(restaurant.arabicName)}</div>`
+      + `<div style="font-size:9px;">${esc(restaurant.address1)}<br>${esc(restaurant.address2)}</div>`
+      + `<div style="font-size:9px;">Tel: ${esc(restaurant.phone1)}</div>`
+      + `<div style="font-size:9px;font-weight:700;">VAT: ${esc(restaurant.vat)}</div></div>`
+      // Z Report title
+      + `<div style="border-top:2px solid #000;border-bottom:2px solid #000;text-align:center;font-weight:700;font-size:14px;margin:6px 0;padding:4px 0;">Z REPORT<br><span style="font-size:10px;font-weight:400;">تقرير نهاية اليوم</span></div>`
+      + `<div style="display:flex;justify-content:space-between;font-size:10px;"><span>${esc(rangeLabel)}</span><span>${dtStr} ${timeStr}</span></div>`
+      + dv
+      // Grand summary
+      + row("GROSS SALES", `AED ${money(summary.sales)}`, { bold: true, big: true })
+      + row("Net Sales (excl VAT)", `AED ${money(summary.net)}`)
+      + row("VAT 5% Collected", `AED ${money(summary.vat)}`)
+      + row("Total Orders", `${summary.count}`)
+      + row("Cancelled", `${summary.cancelled}`)
+      + row("Total Items Sold", `${totalItems}`)
+      + row("Avg Order Value", `AED ${money(summary.count ? summary.sales / summary.count : 0)}`)
+      + row("Discounts Given", `AED ${money(summary.disc)}`)
+      + dv
+      // Category breakdown
+      + hd("SALES BY CATEGORY / حسب الفئة")
+      + (byCatDetailed.length === 0 ? `<div style="text-align:center;font-size:10px;color:#999;padding:4px;">No sales</div>` : catRows)
+      + `<div style="border-top:1px solid #000;margin-top:3px;padding-top:2px;">`
+      + row("TOTAL", `AED ${money(summary.sales)}`, { bold: true })
+      + `</div>`
+      + dv
+      // Payment methods
+      + hd("PAYMENT METHODS / طرق الدفع")
+      + payRows
+      + row("TOTAL", `AED ${money(summary.sales)}`, { bold: true, top: true })
+      + dv
+      // Order types
+      + hd("ORDER TYPES / أنواع الطلبات")
+      + typeRows
+      + dv
+      // Cashier summary
+      + hd("CASHIER SUMMARY / ملخص الكاشير")
+      + cashierRows
+      + dv
+      // Hourly breakdown
+      + hd("HOURLY SALES / المبيعات بالساعة")
+      + hourRows
+      + dv
+      // Profit & Loss
+      + hd("PROFIT & LOSS / الربح والخسارة")
+      + row("Gross Sales", `${money(summary.sales)}`)
+      + row("− VAT (5%)", `− ${money(summary.vat)}`)
+      + row("Net Sales", `${money(summary.net)}`, { bold: true })
+      + row("− Food Cost", `− ${money(round2(summary.net - summary.profit))}`)
+      + row("Gross Profit", `${money(summary.profit)}`, { bold: true })
+      + row("− Expenses", `− ${money(expTotal)}`)
+      + `<div style="border-top:2px solid #000;margin-top:3px;padding-top:3px;">`
+      + row("NET PROFIT", `AED ${money(Math.abs(netAfterExp))}`, { bold: true, big: true })
+      + `<div style="text-align:center;font-size:10px;font-weight:700;">${netAfterExp >= 0 ? "✓ IN PROFIT" : "✗ IN LOSS"}</div></div>`
+      + dv
+      // Expenses
+      + hd("EXPENSES / المصروفات")
+      + (expByCat.length === 0 ? `<div style="text-align:center;font-size:10px;color:#999;padding:4px;">No expenses</div>` : expRows)
+      + row("TOTAL EXPENSES", `AED ${money(expTotal)}`, { bold: true, top: true })
+      + dv
+      // Footer
+      + `<div style="text-align:center;font-size:9px;margin-top:6px;">`
+      + `<div style="font-weight:700;">— End of Z Report —</div>`
+      + `<div>— نهاية التقرير —</div>`
+      + `<div style="margin-top:3px;color:#666;">Printed: ${new Date().toLocaleString("en-GB")}</div>`
+      + `<div style="color:#666;">${esc(restaurant.name)}</div>`
+      + `</div></body></html>`;
+
     const frame = document.createElement("iframe");
+    frame.setAttribute("aria-hidden", "true");
     frame.style.cssText = "position:fixed;right:0;bottom:0;width:0;height:0;border:0;";
     document.body.appendChild(frame);
     const cw = frame.contentWindow;
     cw.document.open(); cw.document.write(html); cw.document.close();
-    setTimeout(() => { try { cw.focus(); cw.print(); } catch(e){} setTimeout(() => { try { document.body.removeChild(frame); } catch(_){} }, 1000); }, 300);
+    const fire = () => {
+      try { cw.focus(); cw.print(); } catch (e) { try { window.print(); } catch (_) {} }
+      setTimeout(() => { try { document.body.removeChild(frame); } catch (_) {} }, 1000);
+    };
+    const img = cw.document.querySelector("img.logo");
+    if (img && !img.complete) { img.onload = () => setTimeout(fire, 60); img.onerror = () => setTimeout(fire, 60); setTimeout(fire, 900); }
+    else setTimeout(fire, 150);
   }
 
   // Z Report inline view
