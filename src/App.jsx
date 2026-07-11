@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useMemo } from "react";
+import { createPortal } from "react-dom";
 import {
   LayoutDashboard, Utensils, ClipboardList, Package, BarChart3, Settings as SettingsIcon,
   ChefHat, LogOut, Search, Plus, Minus, Trash2, X, Printer, Mail, MessageCircle,
@@ -34,6 +35,93 @@ const RESTAURANT_DEFAULT = {
   receiptHeader: "Tax Invoice  •  فاتورة ضريبية",
   receiptFooter: "Thank you — Dhanyabad — شكراً لكم  •  Visit again!",
 };
+
+/* ------------------------- CLOUD SYNC (multi-device) ----------------------
+   To share users, orders, menu & settings across several devices, connect a
+   free Supabase project (https://supabase.com):
+
+   1) Create a project → SQL Editor → run this once:
+
+        create table if not exists pos_kv (
+          key text primary key,
+          value text,
+          updated_at timestamptz default now()
+        );
+        alter table pos_kv enable row level security;
+        create policy "pos_kv_anon" on pos_kv
+          for all using (true) with check (true);
+
+   2) Project Settings → API → copy the Project URL and the "anon public"
+      key into the two constants below.
+
+   Leave both blank and the app keeps working on this device only
+   (localStorage), exactly like before.
+
+   SECURITY NOTE: the anon key + the open policy above let anyone who has
+   the key read/write this table. Treat the key like a password (don't post
+   the file publicly). For a public deployment, move to Supabase Auth with
+   per-user policies — the role model in this app is already shaped for it.
+
+   HOW SYNC WORKS
+   • Orders & expenses are merged record-by-record (never overwritten), so
+     two tills billing at the same time can't wipe out each other's sales.
+   • Users, menu, inventory & settings are last-write-wins — manage those
+     from one device at a time.
+   • Devices pull each other's changes every SYNC_INTERVAL_MS and on load.
+   • Offline? Everything keeps saving locally and syncs when back online.
+---------------------------------------------------------------------------- */
+const SUPABASE_URL = "";      // e.g. "https://abcd1234.supabase.co"
+const SUPABASE_ANON_KEY = ""; // the long "anon public" API key
+
+const CLOUD_URL = (SUPABASE_URL || (typeof window !== "undefined" && window.POS_SUPABASE_URL) || "").replace(/\/+$/, "");
+const CLOUD_KEY = SUPABASE_ANON_KEY || (typeof window !== "undefined" && window.POS_SUPABASE_ANON_KEY) || "";
+const CLOUD_ENABLED = Boolean(CLOUD_URL && CLOUD_KEY);
+const SYNC_INTERVAL_MS = (typeof window !== "undefined" && window.POS_SYNC_MS) || 15000;
+
+const SYNC_KEYS = ["chai_reset_at", "chai_staff", "chai_orders", "chai_expenses", "chai_inventory", "chai_menu", "chai_restaurant"];
+// Keys holding arrays of records that several devices append to concurrently.
+// These are merged per record (by the given id field) instead of overwritten.
+const CLOUD_MERGE_KEYS = { chai_orders: "id", chai_expenses: "id" };
+
+const sbHeaders = () => ({
+  apikey: CLOUD_KEY,
+  Authorization: `Bearer ${CLOUD_KEY}`,
+  "Content-Type": "application/json",
+});
+
+async function cloudGet(key) {
+  const res = await fetch(`${CLOUD_URL}/rest/v1/pos_kv?key=eq.${encodeURIComponent(key)}&select=value`, { headers: sbHeaders() });
+  if (!res.ok) throw new Error(`cloud read ${key}: HTTP ${res.status}`);
+  const rows = await res.json();
+  return rows.length ? rows[0].value : null;
+}
+
+async function cloudPut(key, value) {
+  const res = await fetch(`${CLOUD_URL}/rest/v1/pos_kv?on_conflict=key`, {
+    method: "POST",
+    headers: { ...sbHeaders(), Prefer: "resolution=merge-duplicates" },
+    body: JSON.stringify([{ key, value, updated_at: new Date().toISOString() }]),
+  });
+  if (!res.ok) throw new Error(`cloud write ${key}: HTTP ${res.status}`);
+}
+
+// Merge two record arrays by id; for the same id the record with the newer
+// updatedAt/createdAt wins. Records created before `notBefore` (the last
+// "Clear sales" timestamp) are dropped on every device.
+function mergeRecords(remoteArr, localArr, idKey, notBefore = 0) {
+  const stamp = (r) => new Date(r.updatedAt || r.createdAt || 0).getTime();
+  const created = (r) => new Date(r.createdAt || 0).getTime();
+  const m = new Map();
+  [...(Array.isArray(remoteArr) ? remoteArr : []), ...(Array.isArray(localArr) ? localArr : [])].forEach((r) => {
+    if (!r || r[idKey] == null) return;
+    if (notBefore && created(r) < notBefore) return;
+    const prev = m.get(r[idKey]);
+    if (!prev || stamp(r) > stamp(prev)) m.set(r[idKey], r);
+  });
+  return [...m.values()].sort((a, b) =>
+    (new Date(b.createdAt || 0) - new Date(a.createdAt || 0)) || String(b[idKey]).localeCompare(String(a[idKey]))
+  );
+}
 
 /* ----------------------------- MENU DATA ---------------------------------- */
 /* Imported from the uploaded menu (prices in AED, VAT-inclusive).            */
@@ -339,13 +427,78 @@ export default function App() {
   const [staff, setStaff] = useState(INITIAL_STAFF);
   const [storageReady, setStorageReady] = useState(false);
 
-  // Helper: safe read from storage (returns null if key missing)
-  const safeGet = async (key) => {
-    try { const r = await window.storage.get(key); return r && r.value ? r.value : null; } catch(e) { return null; }
+  const [cloudStatus, setCloudStatus] = useState(CLOUD_ENABLED ? "sync" : "off"); // off | sync | ok | error
+  const lastSyncedRef = useRef({});   // last value the cloud is known to hold, per key
+  const cloudPrimedRef = useRef(false); // true after the FIRST pull — no pushes before that,
+                                        // so a fresh device can never overwrite cloud data at boot
+  const cloudResetAtRef = useRef(0);  // "Clear sales" watermark (ms since epoch) — see resetDemo
+  const stateRef = useRef({});        // live state snapshot the pull loop can read
+  useEffect(() => {
+    stateRef.current = { chai_staff: staff, chai_orders: orders, chai_expenses: expenses, chai_inventory: inventory, chai_menu: items, chai_restaurant: restaurant };
+  });
+
+  // Storage adapter — three tiers:
+  //   1. Claude artifact storage API (when running inside claude.ai)
+  //   2. localStorage (local dev / deployed builds) — per-device cache
+  //   3. Supabase cloud (when configured above) — shared across devices
+  const hasArtifactStorage = () =>
+    typeof window !== "undefined" && window.storage && typeof window.storage.get === "function";
+
+  // Helper: safe read from device storage (returns null if key missing)
+  const localGet = async (key) => {
+    if (hasArtifactStorage()) {
+      try {
+        const r = await window.storage.get(key);
+        if (r && r.value != null) return r.value;
+      } catch (e) { /* key missing or API error — fall through to localStorage */ }
+    }
+    try { return window.localStorage ? window.localStorage.getItem(key) : null; } catch (e) { return null; }
   };
-  // Helper: safe write to storage
+  // Helper: safe write to device storage
+  const localSet = async (key, val) => {
+    if (hasArtifactStorage()) {
+      try { await window.storage.set(key, val); return; } catch (e) { console.warn("Artifact storage write failed:", key, e); }
+    }
+    try { if (window.localStorage) window.localStorage.setItem(key, val); } catch (e) { console.warn("localStorage write failed:", key, e); }
+  };
+  const safeGet = localGet;
+
+  // Apply a value coming from the cloud to React state.
+  // Orders & expenses merge with whatever this device has right now, so a
+  // bill charged a moment ago can never be clobbered by an incoming pull.
+  const applyRemote = (key, json) => {
+    try {
+      const p = JSON.parse(json);
+      if (key === "chai_staff" && Array.isArray(p) && p.length > 0) setStaff(p);
+      else if (key === "chai_orders" && Array.isArray(p)) setOrders((prev) => mergeRecords(p, prev, "id", cloudResetAtRef.current));
+      else if (key === "chai_expenses" && Array.isArray(p)) setExpenses((prev) => mergeRecords(p, prev, "id", cloudResetAtRef.current));
+      else if (key === "chai_inventory" && Array.isArray(p)) setInventory(p);
+      else if (key === "chai_menu" && Array.isArray(p) && p.length > 0) setItems(p);
+      else if (key === "chai_restaurant" && p && typeof p === "object") setRestaurant(p);
+    } catch (e) { /* ignore malformed cloud value */ }
+  };
+
+  // Write to this device, then sync to the cloud.
   const safeSet = async (key, val) => {
-    try { await window.storage.set(key, val); } catch(e) { console.warn("Storage write failed:", key, e); }
+    await localSet(key, val);
+    if (!CLOUD_ENABLED) return;
+    if (!cloudPrimedRef.current) return; // first pull must finish before this device may write to the cloud
+    if (lastSyncedRef.current[key] === val) return; // cloud already holds this exact value
+    try {
+      let out = val;
+      if (CLOUD_MERGE_KEYS[key]) {
+        // merge with the cloud copy so we never overwrite another till's records
+        const remote = await cloudGet(key);
+        out = JSON.stringify(mergeRecords(remote ? JSON.parse(remote) : [], JSON.parse(val), CLOUD_MERGE_KEYS[key], cloudResetAtRef.current));
+      }
+      await cloudPut(key, out);
+      lastSyncedRef.current[key] = out;
+      if (out !== val) { applyRemote(key, out); localSet(key, out); } // pull merged extras into state
+      setCloudStatus("ok");
+    } catch (e) {
+      setCloudStatus("error");
+      console.warn("Cloud sync failed (saved locally, will retry):", key, e.message);
+    }
   };
 
   // ---- Persistent storage: load on mount ----
@@ -369,6 +522,9 @@ export default function App() {
       const raw_menu = await safeGet("chai_menu");
       if (raw_menu) { try { const p = JSON.parse(raw_menu); if (Array.isArray(p) && p.length > 0) setItems(p); } catch(e){} }
 
+      const raw_reset = await safeGet("chai_reset_at");
+      if (raw_reset) cloudResetAtRef.current = Date.parse(raw_reset) || 0;
+
       setStorageReady(true);
     })();
   }, []);
@@ -380,6 +536,65 @@ export default function App() {
   useEffect(() => { if (storageReady) safeSet("chai_inventory", JSON.stringify(inventory)); }, [inventory, storageReady]);
   useEffect(() => { if (storageReady) safeSet("chai_restaurant", JSON.stringify(restaurant)); }, [restaurant, storageReady]);
   useEffect(() => { if (storageReady) safeSet("chai_menu", JSON.stringify(items)); }, [items, storageReady]);
+
+  // ---- Cloud pull loop: bring other devices' changes onto this one ----
+  useEffect(() => {
+    if (!CLOUD_ENABLED || !storageReady) return;
+    let stopped = false;
+    const pull = async () => {
+      try {
+        for (const key of SYNC_KEYS) {
+          const remote = await cloudGet(key);
+          if (stopped) return;
+          if (remote == null) {
+            // Cloud has nothing for this key yet — the very first device seeds it.
+            if (!cloudPrimedRef.current && key !== "chai_reset_at" && stateRef.current[key] != null) {
+              const localJson = JSON.stringify(stateRef.current[key]);
+              await cloudPut(key, localJson);
+              lastSyncedRef.current[key] = localJson;
+            }
+            continue;
+          }
+          if (key === "chai_reset_at") {
+            // another device pressed "Clear sales" — drop records older than the watermark
+            const t = Date.parse(remote) || 0;
+            if (t > cloudResetAtRef.current) {
+              cloudResetAtRef.current = t;
+              localSet(key, remote);
+              setOrders((prev) => mergeRecords([], prev, "id", t));
+              setExpenses((prev) => mergeRecords([], prev, "id", t));
+            }
+            continue;
+          }
+          if (remote === lastSyncedRef.current[key]) continue; // nothing new from other devices
+          if (CLOUD_MERGE_KEYS[key]) {
+            const merged = mergeRecords(JSON.parse(remote), stateRef.current[key] || [], CLOUD_MERGE_KEYS[key], cloudResetAtRef.current);
+            const mergedJson = JSON.stringify(merged);
+            lastSyncedRef.current[key] = remote;
+            applyRemote(key, mergedJson);
+            localSet(key, mergedJson);
+            if (mergedJson !== remote) { await cloudPut(key, mergedJson); lastSyncedRef.current[key] = mergedJson; }
+          } else {
+            lastSyncedRef.current[key] = remote;
+            applyRemote(key, remote);
+            localSet(key, remote);
+          }
+        }
+        if (!stopped) {
+          // Unlock pushes only after a full first pull has been applied —
+          // offline orders/expenses were already pushed back (merged) above.
+          cloudPrimedRef.current = true;
+          setCloudStatus("ok");
+        }
+      } catch (e) {
+        if (!stopped) setCloudStatus("error");
+        console.warn("Cloud pull failed (will retry):", e.message);
+      }
+    };
+    pull();
+    const t = setInterval(pull, SYNC_INTERVAL_MS);
+    return () => { stopped = true; clearInterval(t); };
+  }, [storageReady]);
 
   // POS cart
   const [lines, setLines] = useState([]);
@@ -461,8 +676,9 @@ export default function App() {
     if (lines.length === 0) { flash("Add items before charging", "warn"); return; }
     const t = computeTotals(lines, discMode, discValue, serviceOn, restaurant.servicePct);
     const order = {
-      id: "O" + Date.now(),
-      ref: orders.length + 1,
+      // random suffix keeps ids unique even if two tills bill in the same millisecond
+      id: "O" + Date.now() + "-" + Math.random().toString(36).slice(2, 7),
+      ref: orders.reduce((m, o) => Math.max(m, Number(o.ref) || 0), 0) + 1,
       lines: lines.map((l) => ({ ...l })),
       totals: t,
       type: orderType,
@@ -504,7 +720,7 @@ export default function App() {
   }
 
   const setStatus = (id, status) =>
-    setOrders((prev) => prev.map((o) => o.id === id ? { ...o, status } : o));
+    setOrders((prev) => prev.map((o) => o.id === id ? { ...o, status, updatedAt: new Date().toISOString() } : o));
 
   /* ----------------------------- DERIVED --------------------------------- */
   const todays = useMemo(() => {
@@ -534,14 +750,21 @@ export default function App() {
 
   const expToday = useMemo(() => {
     const d0 = new Date(); d0.setHours(0, 0, 0, 0);
-    const list = expenses.filter((e) => new Date(e.createdAt) >= d0);
+    const list = expenses.filter((e) => !e.deleted && new Date(e.createdAt) >= d0);
     return { list, total: round2(list.reduce((s, e) => s + e.amount, 0)) };
   }, [expenses]);
 
   function resetDemo() {
+    // Watermark the clear time: every device (including this one) drops
+    // orders/expenses created before it, so cleared records can't come back
+    // through a merge from another till.
+    const nowIso = new Date().toISOString();
+    cloudResetAtRef.current = Date.parse(nowIso);
     setOrders([]); setExpenses([]); setHeld([]); clearCart();
     safeSet("chai_orders", "[]"); safeSet("chai_expenses", "[]");
-    flash("Sales & expenses cleared");
+    localSet("chai_reset_at", nowIso);
+    if (CLOUD_ENABLED) cloudPut("chai_reset_at", nowIso).catch(() => {});
+    flash(CLOUD_ENABLED ? "Sales & expenses cleared on all devices" : "Sales & expenses cleared");
   }
 
   /* ----------------------------- RENDER ---------------------------------- */
@@ -561,7 +784,7 @@ export default function App() {
   ].filter((n) => allowed.includes(n.id));
 
   return (
-    <div style={{ ...vars, background: "var(--bg)", color: "var(--ink)" }} className="w-full h-screen flex overflow-hidden">
+    <div style={{ ...vars, background: "var(--bg)", color: "var(--ink)" }} className="app-root w-full h-screen flex overflow-hidden">
       <StyleBlock />
 
       {/* Sidebar */}
@@ -632,6 +855,14 @@ export default function App() {
               <Clock size={14} />
               {now.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
             </div>
+            {CLOUD_ENABLED && (
+              <div className="hidden sm:flex items-center gap-1.5 text-xs font-semibold px-2.5 py-1.5 rounded-full"
+                title={cloudStatus === "ok" ? "Synced with cloud — other devices see this data" : cloudStatus === "error" ? "Offline — saving on this device, will sync when back online" : "Syncing…"}
+                style={{ background: "var(--surface2)", color: cloudStatus === "ok" ? "#1F9D6B" : cloudStatus === "error" ? "#E6553A" : "var(--muted)" }}>
+                <span className="w-1.5 h-1.5 rounded-full" style={{ background: cloudStatus === "ok" ? "#1F9D6B" : cloudStatus === "error" ? "#E6553A" : "#C19A2B" }} />
+                {cloudStatus === "ok" ? "Synced" : cloudStatus === "error" ? "Offline" : "Syncing"}
+              </div>
+            )}
             {lowStock.length > 0 && (
               <button onClick={() => setView("inventory")} className="relative p-2 rounded-full" style={{ background: "var(--surface2)" }} title={`${lowStock.length} low-stock items`}>
                 <Bell size={18} style={{ color: "var(--ink)" }} />
@@ -1573,7 +1804,7 @@ function Expenses({ expenses, setExpenses, flash, user }) {
     if (range === "today") { const d0 = new Date(); d0.setHours(0, 0, 0, 0); return d >= d0; }
     return d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear();
   };
-  const filtered = expenses.filter(inRange).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  const filtered = expenses.filter((e) => !e.deleted).filter(inRange).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
   const total = round2(filtered.reduce((s, e) => s + e.amount, 0));
   const byCat = (() => {
     const m = {};
@@ -1592,7 +1823,9 @@ function Expenses({ expenses, setExpenses, flash, user }) {
     setAmount(""); setVendor("");
     flash("Expense added");
   };
-  const remove = (id) => { setExpenses((xs) => xs.filter((e) => e.id !== id)); flash("Expense removed"); };
+  // Tombstone instead of hard delete: the `deleted` flag syncs to other
+  // devices; a hard-deleted row would just come back on the next merge.
+  const remove = (id) => { setExpenses((xs) => xs.map((e) => e.id === id ? { ...e, deleted: true, updatedAt: new Date().toISOString() } : e)); flash("Expense removed"); };
 
   const exportCSV = () => {
     const rows = [["Date", "Time", "Category", "Vendor/For", "Method", "Amount (AED)"]];
@@ -1700,13 +1933,31 @@ function Expenses({ expenses, setExpenses, flash, user }) {
   );
 }
 
+/* ---- 80mm thermal print primitives (used by the printable Z Report) ---- */
+function ZRow({ en, ar, val, bold, top }) {
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, fontWeight: bold ? 700 : 400, borderTop: top ? "1px solid #000" : "none", paddingTop: top ? 4 : 0, marginTop: top ? 2 : 0 }}>
+      <span style={{ lineHeight: 1.15 }}>{en}{ar ? <><br /><span dir="rtl" style={{ fontSize: 8, color: "#000" }}>{ar}</span></> : null}</span>
+      <span style={{ whiteSpace: "nowrap", textAlign: "right" }}>{val}</span>
+    </div>
+  );
+}
+function ZSec({ children }) {
+  return <div style={{ borderTop: "1px dashed #000", borderBottom: "1px dashed #000", textAlign: "center", fontWeight: 700, margin: "6px 0", padding: "3px 0" }}>{children}</div>;
+}
+function ZDiv() {
+  return <div style={{ borderTop: "1px dashed #000", margin: "6px 0" }} />;
+}
+
 function Reports({ orders, todays, items, restaurant, expenses = [] }) {
   const [range, setRange] = useState("today");
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
   const [showZReport, setShowZReport] = useState(false);
+  const [printedAt, setPrintedAt] = useState(null); // timestamp shown on the printed Z report
 
   const todayStr = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; };
+  const rangeLabel = range === "today" ? "Today" : range === "yesterday" ? "Yesterday" : range === "week" ? "This Week" : range === "month" ? "This Month" : range === "custom" ? `${dateFrom || ""} to ${dateTo || todayStr()}` : "All Time";
 
   const data = useMemo(() => {
     if (range === "today") return todays;
@@ -1744,22 +1995,23 @@ function Reports({ orders, todays, items, restaurant, expenses = [] }) {
   }, [data, done]);
 
   const expFiltered = useMemo(() => {
-    if (range === "all") return expenses;
-    if (range === "today") { const d0 = new Date(); d0.setHours(0,0,0,0); return expenses.filter((e) => new Date(e.createdAt) >= d0); }
+    const live = expenses.filter((e) => !e.deleted);
+    if (range === "all") return live;
+    if (range === "today") { const d0 = new Date(); d0.setHours(0,0,0,0); return live.filter((e) => new Date(e.createdAt) >= d0); }
     if (range === "yesterday") {
       const y = new Date(); y.setDate(y.getDate() - 1); y.setHours(0,0,0,0);
       const yEnd = new Date(y); yEnd.setHours(23,59,59,999);
-      return expenses.filter((e) => { const d = new Date(e.createdAt); return d >= y && d <= yEnd; });
+      return live.filter((e) => { const d = new Date(e.createdAt); return d >= y && d <= yEnd; });
     }
-    if (range === "week") { const w = new Date(); w.setDate(w.getDate() - 7); w.setHours(0,0,0,0); return expenses.filter((e) => new Date(e.createdAt) >= w); }
-    if (range === "month") { const m = new Date(); m.setDate(1); m.setHours(0,0,0,0); return expenses.filter((e) => new Date(e.createdAt) >= m); }
+    if (range === "week") { const w = new Date(); w.setDate(w.getDate() - 7); w.setHours(0,0,0,0); return live.filter((e) => new Date(e.createdAt) >= w); }
+    if (range === "month") { const m = new Date(); m.setDate(1); m.setHours(0,0,0,0); return live.filter((e) => new Date(e.createdAt) >= m); }
     if (range === "custom" && dateFrom) {
       const from = new Date(dateFrom); from.setHours(0,0,0,0);
       const to = dateTo ? new Date(dateTo) : new Date(); to.setHours(23,59,59,999);
-      return expenses.filter((e) => { const d = new Date(e.createdAt); return d >= from && d <= to; });
+      return live.filter((e) => { const d = new Date(e.createdAt); return d >= from && d <= to; });
     }
     const d0 = new Date(); d0.setHours(0,0,0,0);
-    return expenses.filter((e) => new Date(e.createdAt) >= d0);
+    return live.filter((e) => new Date(e.createdAt) >= d0);
   }, [expenses, range, dateFrom, dateTo]);
   const expTotal = round2(expFiltered.reduce((s, e) => s + e.amount, 0));
   const expByCat = useMemo(() => {
@@ -1853,6 +2105,29 @@ function Reports({ orders, todays, items, restaurant, expenses = [] }) {
     return Object.values(m).sort((a, b) => b.revenue - a.revenue);
   }, [done]);
 
+  // Day-by-day summary of the selected range — lets you see every trading date at a glance.
+  const dayKey = (iso) => { const d = new Date(iso); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; };
+  const byDay = useMemo(() => {
+    const m = {};
+    const blank = (date) => ({ date, orders: 0, gross: 0, vat: 0, profit: 0, expenses: 0 });
+    done.forEach((o) => {
+      const k = dayKey(o.createdAt);
+      if (!m[k]) m[k] = blank(k);
+      m[k].orders += 1;
+      m[k].gross += o.totals.grandTotal;
+      m[k].vat += o.totals.vatAmount;
+      m[k].profit += o.totals.profit;
+    });
+    expFiltered.forEach((e) => {
+      const k = dayKey(e.createdAt);
+      if (!m[k]) m[k] = blank(k);
+      m[k].expenses += e.amount;
+    });
+    return Object.values(m)
+      .map((r) => ({ ...r, gross: round2(r.gross), vat: round2(r.vat), profit: round2(r.profit), expenses: round2(r.expenses), net: round2(r.profit - r.expenses) }))
+      .sort((a, b) => (a.date < b.date ? 1 : -1)); // newest first
+  }, [done, expFiltered]);
+
   function exportCSV() {
     const rows = [["Order Ref", "Date/Time", "Customer", "Type", "Items", "Subtotal", "Discount", "Net", "VAT", "Grand Total", "Payment", "Status"]];
     data.forEach((o) => rows.push([
@@ -1883,6 +2158,11 @@ function Reports({ orders, todays, items, restaurant, expenses = [] }) {
       Vendor: e.vendor, Method: e.method, Amount: round2(e.amount),
     })));
     XLSX.utils.book_append_sheet(wb, ws3, "Expenses");
+    // Day-wise summary sheet
+    const wsDaily = XLSX.utils.json_to_sheet(byDay.map((d) => ({
+      Date: d.date, Orders: d.orders, Gross: d.gross, VAT: d.vat, Expenses: d.expenses, NetProfit: d.net,
+    })));
+    XLSX.utils.book_append_sheet(wb, wsDaily, "Daily Summary");
     // Z Report summary sheet
     const zRows = [
       { Metric: "Gross Sales (incl. VAT)", AED: round2(summary.sales) },
@@ -1910,101 +2190,24 @@ function Reports({ orders, todays, items, restaurant, expenses = [] }) {
     download(new Blob([out], { type: "application/octet-stream" }), `chai-sales-${range}.xlsx`);
   }
 
+  // Print the Z Report on 80mm thermal paper.
+  // The report is rendered into a hidden #print-zreport element (see the
+  // portal at the bottom of this component) and printed with window.print().
+  // The @page rule in StyleBlock forces the 80mm roll size, and the print CSS
+  // hides the app so ONLY the thermal report comes out. This works everywhere
+  // — no popups or iframes that can get blocked.
   function printZReport() {
-    const dtStr = new Date().toLocaleDateString("en-GB") + " " + new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
-    const rangeLabel = range === "today" ? "Today" : range === "yesterday" ? "Yesterday" : range === "week" ? "This Week" : range === "month" ? "This Month" : range === "custom" ? `${dateFrom || ""} to ${dateTo || todayStr()}` : "All Time";
-    const esc = (s) => String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-    // Same bilingual row helper as the product bill
-    const bi = (en, ar, val, o = {}) =>
-      `<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;${o.bold ? "font-weight:700;" : ""}${o.top ? "border-top:1px solid #000;padding-top:4px;margin-top:2px;" : ""}"><span style="line-height:1.15;">${en}${ar ? `<br><span dir="rtl" style="font-size:8px;color:#000;">${ar}</span>` : ""}</span><span style="white-space:nowrap;text-align:right;">${val}</span></div>`;
-    const totalItems = done.reduce((s, o) => s + o.totals.itemCount, 0);
-
-    // Category item rows
-    let catRows = "";
-    byCatDetailed.forEach((c) => {
-      const catEmoji = CATEGORIES.find((x) => x.name === c.category)?.emoji || "";
-      catRows += `<div style="display:flex;justify-content:space-between;font-weight:700;padding:3px 0 1px;border-bottom:1px dotted #999;"><span>${catEmoji} ${esc(c.category)}</span><span>${money(c.revenue)}</span></div>`;
-      c.items.forEach((i) => {
-        catRows += `<div style="display:flex;justify-content:space-between;padding:1px 0 1px 8px;"><span>${i.qty} &times; ${esc(i.name)}</span><span>${money(i.revenue)}</span></div>`;
-      });
-    });
-
-    // Build HTML — exact same CSS & structure as product bill receipt
-    const html =
-      `<!doctype html><html><head><meta charset="utf-8"><title>Z Report</title><style>@page{size:80mm auto;margin:3mm}*{box-sizing:border-box}body{font-family:'Courier New',monospace;color:#000;width:74mm;margin:0 auto;font-size:12px;line-height:1.35}.c{text-align:center}.dv{border-top:1px dashed #000;margin:6px 0}img.logo{width:58px;height:auto;display:block;margin:0 auto 4px}</style></head><body>` +
-      // Header — identical to product bill
-      `<div class="c"><img class="logo" src="${LOGO_MONO}" alt=""/><div style="font-weight:700;font-size:14px;">${esc(restaurant.name)}</div><div dir="rtl" style="font-size:12px;">${esc(restaurant.arabicName)}</div><div style="font-size:10px;">${esc(restaurant.address1)}<br>${esc(restaurant.address2)}</div><div style="font-size:10px;">Tel/&#1607;&#1575;&#1578;&#1601;: ${esc(restaurant.phone1)}</div><div style="font-size:10px;font-weight:700;">VAT/&#1575;&#1604;&#1585;&#1602;&#1605; &#1575;&#1604;&#1590;&#1585;&#1610;&#1576;&#1610;: ${esc(restaurant.vat)}</div></div>` +
-      // Title — same dashed border style as receipt header
-      `<div style="border-top:1px dashed #000;border-bottom:1px dashed #000;text-align:center;font-weight:700;margin:6px 0;padding:3px 0;">Z REPORT &bull; &#1578;&#1602;&#1585;&#1610;&#1585; &#1606;&#1607;&#1575;&#1610;&#1577; &#1575;&#1604;&#1610;&#1608;&#1605;</div>` +
-      `<div style="display:flex;justify-content:space-between;"><span>Period: <b>${esc(rangeLabel)}</b></span><span>${dtStr}</span></div>` +
-      `<div class="dv"></div>` +
-      // Summary section
-      `<div style="display:flex;justify-content:space-between;font-weight:700;font-size:10px;"><span>SUMMARY</span><span>&#1605;&#1604;&#1582;&#1589;</span></div>` +
-      bi("Gross Sales", "&#1573;&#1580;&#1605;&#1575;&#1604;&#1610; &#1575;&#1604;&#1605;&#1576;&#1610;&#1593;&#1575;&#1578;", `AED ${money(summary.sales)}`, { bold: true }) +
-      bi("Net Sales", "&#1589;&#1575;&#1601;&#1610; &#1575;&#1604;&#1605;&#1576;&#1610;&#1593;&#1575;&#1578;", `AED ${money(summary.net)}`) +
-      bi("VAT 5%", "&#1590;&#1585;&#1610;&#1576;&#1577; &#1575;&#1604;&#1602;&#1610;&#1605;&#1577; &#1575;&#1604;&#1605;&#1590;&#1575;&#1601;&#1577;", `AED ${money(summary.vat)}`) +
-      bi("Total Orders", "&#1573;&#1580;&#1605;&#1575;&#1604;&#1610; &#1575;&#1604;&#1591;&#1604;&#1576;&#1575;&#1578;", `${summary.count}`) +
-      bi("Cancelled", "&#1605;&#1604;&#1594;&#1575;&#1577;", `${summary.cancelled}`) +
-      bi("Items Sold", "&#1575;&#1604;&#1571;&#1589;&#1606;&#1575;&#1601; &#1575;&#1604;&#1605;&#1576;&#1575;&#1593;&#1577;", `${totalItems}`) +
-      bi("Avg Order", "&#1605;&#1578;&#1608;&#1587;&#1591; &#1575;&#1604;&#1591;&#1604;&#1576;", `AED ${money(summary.count ? summary.sales / summary.count : 0)}`) +
-      bi("Discounts", "&#1575;&#1604;&#1582;&#1589;&#1608;&#1605;&#1575;&#1578;", `AED ${money(summary.disc)}`) +
-      `<div class="dv"></div>` +
-      // Sales by category
-      `<div style="border-top:1px dashed #000;border-bottom:1px dashed #000;text-align:center;font-weight:700;margin:6px 0;padding:3px 0;">SALES BY CATEGORY &bull; &#1581;&#1587;&#1576; &#1575;&#1604;&#1601;&#1574;&#1577;</div>` +
-      `<div style="display:flex;justify-content:space-between;font-weight:700;font-size:10px;margin-bottom:2px;"><span>CATEGORY / ITEM</span><span>TOTAL</span></div>` +
-      (byCatDetailed.length === 0 ? `<div class="c" style="padding:4px;color:#666;">No sales</div>` : catRows) +
-      bi("TOTAL", "&#1575;&#1604;&#1605;&#1580;&#1605;&#1608;&#1593;", `AED ${money(summary.sales)}`, { bold: true, top: true }) +
-      `<div class="dv"></div>` +
-      // Payment methods
-      `<div style="border-top:1px dashed #000;border-bottom:1px dashed #000;text-align:center;font-weight:700;margin:6px 0;padding:3px 0;">PAYMENT METHODS &bull; &#1591;&#1585;&#1602; &#1575;&#1604;&#1583;&#1601;&#1593;</div>` +
-      byPay.map((p) => bi(p.method, "", `AED ${money(p.value)}`)).join("") +
-      bi("TOTAL", "&#1575;&#1604;&#1605;&#1580;&#1605;&#1608;&#1593;", `AED ${money(summary.sales)}`, { bold: true, top: true }) +
-      `<div class="dv"></div>` +
-      // Order types
-      `<div style="border-top:1px dashed #000;border-bottom:1px dashed #000;text-align:center;font-weight:700;margin:6px 0;padding:3px 0;">ORDER TYPES &bull; &#1571;&#1606;&#1608;&#1575;&#1593; &#1575;&#1604;&#1591;&#1604;&#1576;&#1575;&#1578;</div>` +
-      byType.map((t) => bi(`${t.type} (${t.count})`, "", `AED ${money(t.revenue)}`)).join("") +
-      `<div class="dv"></div>` +
-      // Cashier
-      `<div style="border-top:1px dashed #000;border-bottom:1px dashed #000;text-align:center;font-weight:700;margin:6px 0;padding:3px 0;">CASHIER &bull; &#1575;&#1604;&#1603;&#1575;&#1588;&#1610;&#1585;</div>` +
-      byCashier.map((c) => bi(`${c.name} (${c.count})`, "", `AED ${money(c.revenue)}`)).join("") +
-      `<div class="dv"></div>` +
-      // Hourly
-      `<div style="border-top:1px dashed #000;border-bottom:1px dashed #000;text-align:center;font-weight:700;margin:6px 0;padding:3px 0;">HOURLY SALES &bull; &#1575;&#1604;&#1605;&#1576;&#1610;&#1593;&#1575;&#1578; &#1576;&#1575;&#1604;&#1587;&#1575;&#1593;&#1577;</div>` +
-      `<div style="display:flex;justify-content:space-between;font-weight:700;font-size:10px;"><span>HOUR</span><span>ORDERS</span><span>TOTAL</span></div>` +
-      hourly.map((h) => `<div style="display:flex;justify-content:space-between;padding:1px 0;"><span>${h.hour}</span><span>${h.orders}</span><span>${money(h.revenue)}</span></div>`).join("") +
-      `<div class="dv"></div>` +
-      // P&L
-      `<div style="border-top:1px dashed #000;border-bottom:1px dashed #000;text-align:center;font-weight:700;margin:6px 0;padding:3px 0;">PROFIT &amp; LOSS &bull; &#1575;&#1604;&#1585;&#1576;&#1581; &#1608;&#1575;&#1604;&#1582;&#1587;&#1575;&#1585;&#1577;</div>` +
-      bi("Gross Sales", "&#1573;&#1580;&#1605;&#1575;&#1604;&#1610; &#1575;&#1604;&#1605;&#1576;&#1610;&#1593;&#1575;&#1578;", `${money(summary.sales)}`) +
-      bi("&minus; VAT (5%)", "&#1590;&#1585;&#1610;&#1576;&#1577; &#1575;&#1604;&#1602;&#1610;&#1605;&#1577; &#1575;&#1604;&#1605;&#1590;&#1575;&#1601;&#1577;", `&minus; ${money(summary.vat)}`) +
-      bi("Net Sales", "&#1589;&#1575;&#1601;&#1610; &#1575;&#1604;&#1605;&#1576;&#1610;&#1593;&#1575;&#1578;", `${money(summary.net)}`, { bold: true }) +
-      bi("&minus; Food Cost", "&#1578;&#1603;&#1604;&#1601;&#1577; &#1575;&#1604;&#1591;&#1593;&#1575;&#1605;", `&minus; ${money(round2(summary.net - summary.profit))}`) +
-      bi("Gross Profit", "&#1573;&#1580;&#1605;&#1575;&#1604;&#1610; &#1575;&#1604;&#1585;&#1576;&#1581;", `${money(summary.profit)}`, { bold: true }) +
-      bi("&minus; Expenses", "&#1575;&#1604;&#1605;&#1589;&#1585;&#1608;&#1601;&#1575;&#1578;", `&minus; ${money(expTotal)}`) +
-      bi("NET PROFIT", "&#1589;&#1575;&#1601;&#1610; &#1575;&#1604;&#1585;&#1576;&#1581;", `AED ${money(Math.abs(netAfterExp))}`, { bold: true, top: true }) +
-      `<div class="dv"></div>` +
-      // Expenses by category
-      `<div style="border-top:1px dashed #000;border-bottom:1px dashed #000;text-align:center;font-weight:700;margin:6px 0;padding:3px 0;">EXPENSES &bull; &#1575;&#1604;&#1605;&#1589;&#1585;&#1608;&#1601;&#1575;&#1578;</div>` +
-      (expByCat.length === 0 ? `<div class="c" style="padding:4px;color:#666;">No expenses</div>` : expByCat.map((c) => bi(c.category, "", `${money(c.value)}`)).join("")) +
-      bi("TOTAL EXPENSES", "&#1573;&#1580;&#1605;&#1575;&#1604;&#1610; &#1575;&#1604;&#1605;&#1589;&#1585;&#1608;&#1601;&#1575;&#1578;", `AED ${money(expTotal)}`, { bold: true, top: true }) +
-      `<div class="dv"></div>` +
-      // Footer — same style as product bill footer
-      `<div class="c" style="margin-top:10px;"><div style="font-weight:700;">— End of Z Report —</div><div dir="rtl">— &#1606;&#1607;&#1575;&#1610;&#1577; &#1575;&#1604;&#1578;&#1602;&#1585;&#1610;&#1585; —</div><div style="font-weight:700;margin-top:4px;">${esc(restaurant.receiptFooter)}</div></div></body></html>`;
-
-    // Print via iframe — same method as product bill
-    const frame = document.createElement("iframe");
-    frame.setAttribute("aria-hidden", "true");
-    frame.style.cssText = "position:fixed;right:0;bottom:0;width:0;height:0;border:0;";
-    document.body.appendChild(frame);
-    const cw = frame.contentWindow;
-    cw.document.open(); cw.document.write(html); cw.document.close();
-    const fire = () => {
-      try { cw.focus(); cw.print(); } catch (e) { try { window.print(); } catch (_) {} }
-      setTimeout(() => { try { document.body.removeChild(frame); } catch (_) {} }, 1000);
+    setPrintedAt(new Date()); // stamp the report with the exact print time
+    document.body.classList.add("printing-z");
+    const cleanup = () => {
+      document.body.classList.remove("printing-z");
+      window.removeEventListener("afterprint", cleanup);
     };
-    const img = cw.document.querySelector("img.logo");
-    if (img && !img.complete) { img.onload = () => setTimeout(fire, 60); img.onerror = () => setTimeout(fire, 60); setTimeout(fire, 900); }
-    else setTimeout(fire, 150);
+    window.addEventListener("afterprint", cleanup);
+    setTimeout(() => {
+      try { window.print(); } catch (e) { console.warn("Print failed:", e); }
+      setTimeout(cleanup, 1500); // safety net for browsers that skip afterprint
+    }, 80);
   }
 
   // Z Report inline view
@@ -2013,7 +2216,7 @@ function Reports({ orders, todays, items, restaurant, expenses = [] }) {
       <div className="flex items-center justify-between flex-wrap gap-2">
         <div>
           <h2 className="text-lg font-bold" style={{ fontFamily: "Fraunces, serif", color: "var(--ink)" }}>Z Report — End of Day</h2>
-          <p className="text-xs" style={{ color: "var(--muted)" }}>{range === "today" ? "Today" : range === "yesterday" ? "Yesterday" : range === "week" ? "This Week" : range === "month" ? "This Month" : range === "custom" ? `${dateFrom || ""} to ${dateTo || todayStr()}` : "All Time"} · {new Date().toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long", year: "numeric" })}</p>
+          <p className="text-xs" style={{ color: "var(--muted)" }}>{rangeLabel} · {new Date().toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long", year: "numeric" })}</p>
         </div>
         <button onClick={printZReport} className="flex items-center gap-1.5 px-4 py-2.5 rounded-xl text-sm font-bold text-white" style={{ background: SIDEBAR_GRAD }}>
           <Printer size={15} /> Print Z Report
@@ -2223,6 +2426,39 @@ function Reports({ orders, todays, items, restaurant, expenses = [] }) {
             <Stat label="Orders" value={summary.count} color="#6D28D9" Icon={ClipboardList} />
           </div>
 
+          {/* Day-wise breakdown — every trading date in the selected range */}
+          <Card pad="p-0">
+            <CardHead title="Day-wise Sales" sub={`${byDay.length} ${byDay.length === 1 ? "day" : "days"} in this range — switch to "All Time" above to see every date`} className="px-4 pt-4" />
+            <div className="overflow-x-auto mt-2" style={{ maxHeight: 420 }}>
+              <table className="w-full text-sm">
+                <thead>
+                  <tr style={{ color: "var(--muted)", borderBottom: "1px solid var(--line)" }}>
+                    <th className="text-left font-semibold px-4 py-3">Date</th>
+                    <th className="text-right font-semibold px-4 py-3">Orders</th>
+                    <th className="text-right font-semibold px-4 py-3">Gross Sales</th>
+                    <th className="text-right font-semibold px-4 py-3">VAT</th>
+                    <th className="text-right font-semibold px-4 py-3">Expenses</th>
+                    <th className="text-right font-semibold px-4 py-3">Net Profit</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {byDay.length === 0 ? (
+                    <tr><td colSpan={6} className="px-4 py-6 text-center" style={{ color: "var(--muted)" }}>No data in this range</td></tr>
+                  ) : byDay.map((d) => (
+                    <tr key={d.date} style={{ borderBottom: "1px solid var(--line)" }}>
+                      <td className="px-4 py-2.5 font-medium whitespace-nowrap" style={{ color: "var(--ink)" }}>{new Date(d.date + "T00:00:00").toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short", year: "numeric" })}</td>
+                      <td className="px-4 py-2.5 text-right tnum" style={{ color: "var(--ink)" }}>{d.orders}</td>
+                      <td className="px-4 py-2.5 text-right tnum font-semibold" style={{ color: "var(--purple)" }}>{money(d.gross)}</td>
+                      <td className="px-4 py-2.5 text-right tnum" style={{ color: "var(--muted)" }}>{money(d.vat)}</td>
+                      <td className="px-4 py-2.5 text-right tnum" style={{ color: "#E6553A" }}>{d.expenses > 0 ? money(d.expenses) : "—"}</td>
+                      <td className="px-4 py-2.5 text-right tnum font-bold" style={{ color: d.net >= 0 ? "#1F9D6B" : "#E6553A" }}>{money(d.net)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </Card>
+
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             <Card>
               <CardHead title="Sales by Category" sub="Revenue (AED)" />
@@ -2311,6 +2547,96 @@ function Reports({ orders, todays, items, restaurant, expenses = [] }) {
             </div>
           </Card>
         </>
+      )}
+
+      {/* ---- Hidden 80mm thermal Z Report — only visible when printing ---- */}
+      {typeof document !== "undefined" && createPortal(
+        <div id="print-zreport" style={{ width: "74mm", margin: 0, background: "#fff", color: "#000", fontFamily: "'Courier New', monospace", fontSize: 12, lineHeight: 1.35, boxSizing: "border-box" }}>
+          {/* Header — identical to the product bill */}
+          <div style={{ textAlign: "center" }}>
+            <img src={LOGO_MONO} alt="" style={{ width: 58, height: "auto", display: "block", margin: "0 auto 4px" }} />
+            <div style={{ fontWeight: 700, fontSize: 14 }}>{restaurant.name}</div>
+            <div dir="rtl" style={{ fontSize: 12 }}>{restaurant.arabicName}</div>
+            <div style={{ fontSize: 10 }}>{restaurant.address1}<br />{restaurant.address2}</div>
+            <div style={{ fontSize: 10 }}>Tel/هاتف: {restaurant.phone1}</div>
+            <div style={{ fontSize: 10, fontWeight: 700 }}>VAT/الرقم الضريبي: {restaurant.vat}</div>
+          </div>
+          <ZSec>Z REPORT • تقرير نهاية اليوم</ZSec>
+          <div style={{ display: "flex", justifyContent: "space-between" }}>
+            <span>Period: <b>{rangeLabel}</b></span>
+            <span>{(printedAt || new Date()).toLocaleDateString("en-GB")} {(printedAt || new Date()).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" })}</span>
+          </div>
+          <ZDiv />
+          <div style={{ display: "flex", justifyContent: "space-between", fontWeight: 700, fontSize: 10 }}><span>SUMMARY</span><span>ملخص</span></div>
+          <ZRow en="Gross Sales" ar="إجمالي المبيعات" val={`AED ${money(summary.sales)}`} bold />
+          <ZRow en="Net Sales" ar="صافي المبيعات" val={`AED ${money(summary.net)}`} />
+          <ZRow en="VAT 5%" ar="ضريبة القيمة المضافة" val={`AED ${money(summary.vat)}`} />
+          <ZRow en="Total Orders" ar="إجمالي الطلبات" val={`${summary.count}`} />
+          <ZRow en="Cancelled" ar="ملغاة" val={`${summary.cancelled}`} />
+          <ZRow en="Items Sold" ar="الأصناف المباعة" val={`${done.reduce((s, o) => s + (o.totals.itemCount || 0), 0)}`} />
+          <ZRow en="Avg Order" ar="متوسط الطلب" val={`AED ${money(summary.count ? summary.sales / summary.count : 0)}`} />
+          <ZRow en="Discounts" ar="الخصومات" val={`AED ${money(summary.disc)}`} />
+          <ZDiv />
+          <ZSec>SALES BY CATEGORY • حسب الفئة</ZSec>
+          <div style={{ display: "flex", justifyContent: "space-between", fontWeight: 700, fontSize: 10, marginBottom: 2 }}><span>CATEGORY / ITEM</span><span>TOTAL</span></div>
+          {byCatDetailed.length === 0 ? (
+            <div style={{ textAlign: "center", padding: 4, color: "#666" }}>No sales</div>
+          ) : byCatDetailed.map((c) => (
+            <div key={c.category}>
+              <div style={{ display: "flex", justifyContent: "space-between", fontWeight: 700, padding: "3px 0 1px", borderBottom: "1px dotted #999" }}>
+                <span>{CATEGORIES.find((x) => x.name === c.category)?.emoji || ""} {c.category}</span><span>{money(c.revenue)}</span>
+              </div>
+              {c.items.map((i) => (
+                <div key={i.name} style={{ display: "flex", justifyContent: "space-between", padding: "1px 0 1px 8px" }}>
+                  <span>{i.qty} × {i.name}</span><span>{money(i.revenue)}</span>
+                </div>
+              ))}
+            </div>
+          ))}
+          <ZRow en="TOTAL" ar="المجموع" val={`AED ${money(summary.sales)}`} bold top />
+          <ZDiv />
+          <ZSec>PAYMENT METHODS • طرق الدفع</ZSec>
+          {byPay.map((p) => <ZRow key={p.method} en={p.method} val={`AED ${money(p.value)}`} />)}
+          <ZRow en="TOTAL" ar="المجموع" val={`AED ${money(summary.sales)}`} bold top />
+          <ZDiv />
+          <ZSec>ORDER TYPES • أنواع الطلبات</ZSec>
+          {byType.map((t) => <ZRow key={t.type} en={`${t.type} (${t.count})`} val={`AED ${money(t.revenue)}`} />)}
+          <ZDiv />
+          <ZSec>CASHIER • الكاشير</ZSec>
+          {byCashier.map((c) => <ZRow key={c.name} en={`${c.name} (${c.count})`} val={`AED ${money(c.revenue)}`} />)}
+          <ZDiv />
+          <ZSec>HOURLY SALES • المبيعات بالساعة</ZSec>
+          <div style={{ display: "flex", justifyContent: "space-between", fontWeight: 700, fontSize: 10 }}><span>HOUR</span><span>ORDERS</span><span>TOTAL</span></div>
+          {hourly.map((h) => (
+            <div key={h.hour} style={{ display: "flex", justifyContent: "space-between", padding: "1px 0" }}>
+              <span style={{ width: "25%" }}>{h.hour}</span>
+              <span style={{ width: "25%", textAlign: "center" }}>{h.orders}</span>
+              <span style={{ width: "35%", textAlign: "right" }}>{money(h.revenue)}</span>
+            </div>
+          ))}
+          <ZDiv />
+          <ZSec>PROFIT &amp; LOSS • الربح والخسارة</ZSec>
+          <ZRow en="Gross Sales" ar="إجمالي المبيعات" val={money(summary.sales)} />
+          <ZRow en="− VAT (5%)" ar="ضريبة القيمة المضافة" val={`− ${money(summary.vat)}`} />
+          <ZRow en="Net Sales" ar="صافي المبيعات" val={money(summary.net)} bold />
+          <ZRow en="− Food Cost" ar="تكلفة الطعام" val={`− ${money(round2(summary.net - summary.profit))}`} />
+          <ZRow en="Gross Profit" ar="إجمالي الربح" val={money(summary.profit)} bold />
+          <ZRow en="− Expenses" ar="المصروفات" val={`− ${money(expTotal)}`} />
+          <ZRow en={netAfterExp >= 0 ? "NET PROFIT" : "NET LOSS"} ar="صافي الربح" val={`AED ${money(Math.abs(netAfterExp))}`} bold top />
+          <ZDiv />
+          <ZSec>EXPENSES • المصروفات</ZSec>
+          {expByCat.length === 0 ? (
+            <div style={{ textAlign: "center", padding: 4, color: "#666" }}>No expenses</div>
+          ) : expByCat.map((c) => <ZRow key={c.category} en={c.category} val={money(c.value)} />)}
+          <ZRow en="TOTAL EXPENSES" ar="إجمالي المصروفات" val={`AED ${money(expTotal)}`} bold top />
+          <ZDiv />
+          <div style={{ textAlign: "center", marginTop: 10 }}>
+            <div style={{ fontWeight: 700 }}>— End of Z Report —</div>
+            <div dir="rtl">— نهاية التقرير —</div>
+            <div style={{ fontWeight: 700, marginTop: 4 }}>{restaurant.receiptFooter}</div>
+          </div>
+        </div>,
+        document.body
       )}
     </div>
   );
@@ -2661,11 +2987,20 @@ function StyleBlock() {
       @keyframes toastup { from{opacity:0; transform:translate(-50%,12px)} to{opacity:1; transform:translate(-50%,0)} }
       input::placeholder { color: var(--muted); opacity:0.7; }
       select { -webkit-appearance:none; appearance:none; }
+      /* Hidden on screen; becomes the printed page for the Z Report */
+      #print-zreport { display: none; }
+      /* 80mm thermal roll: 74mm printable width + 3mm margins each side */
+      @page { size: 80mm auto; margin: 3mm; }
       @media print {
+        html, body { width: 80mm; margin: 0; padding: 0; background: #fff; }
         body * { visibility: hidden !important; }
         #print-receipt, #print-receipt * { visibility: visible !important; }
         #print-receipt { position: fixed; left: 0; top: 0; width: 80mm; max-height:none !important; box-shadow:none; border-radius:0; }
         .no-print { display: none !important; }
+        /* Z Report printing: hide the whole app, show only the thermal sheet */
+        body.printing-z .app-root { display: none !important; }
+        body.printing-z #print-zreport { display: block !important; }
+        body.printing-z #print-zreport, body.printing-z #print-zreport * { visibility: visible !important; }
       }
     `}</style>
   );
