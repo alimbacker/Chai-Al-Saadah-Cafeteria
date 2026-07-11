@@ -2584,7 +2584,7 @@ function Reports({ orders, todays, items, restaurant, expenses = [] }) {
           ) : byCatDetailed.map((c) => (
             <div key={c.category}>
               <div style={{ display: "flex", justifyContent: "space-between", fontWeight: 700, padding: "3px 0 1px", borderBottom: "1px dotted #999" }}>
-                <span>{CATEGORIES.find((x) => x.name === c.category)?.emoji || ""} {c.category}</span><span>{money(c.revenue)}</span>
+                <span>{c.category}</span><span>{money(c.revenue)}</span>
               </div>
               {c.items.map((i) => (
                 <div key={i.name} style={{ display: "flex", justifyContent: "space-between", padding: "1px 0 1px 8px" }}>
