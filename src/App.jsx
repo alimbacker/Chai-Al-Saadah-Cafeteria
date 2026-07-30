@@ -70,13 +70,50 @@ const RESTAURANT_DEFAULT = {
    • Devices pull each other's changes every SYNC_INTERVAL_MS and on load.
    • Offline? Everything keeps saving locally and syncs when back online.
 ---------------------------------------------------------------------------- */
+/*  >>> PASTE YOUR TWO SUPABASE VALUES HERE <<<
+    While these are empty, every device keeps its OWN separate copy of the
+    staff list, orders and menu — which is why a login created on the office
+    PC is rejected on a phone. Fill them in and redeploy to fix that.       */
 const SUPABASE_URL = "";      // e.g. "https://abcd1234.supabase.co"
 const SUPABASE_ANON_KEY = ""; // the long "anon public" API key
 
-const CLOUD_URL = (SUPABASE_URL || (typeof window !== "undefined" && window.POS_SUPABASE_URL) || "").replace(/\/+$/, "");
-const CLOUD_KEY = SUPABASE_ANON_KEY || (typeof window !== "undefined" && window.POS_SUPABASE_ANON_KEY) || "";
+/* Environment variables are also accepted, so the key need not be committed.
+   Supported names: VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY (Vite),
+   NEXT_PUBLIC_… (Next.js), REACT_APP_… (Create React App).
+   If your build tool ever errors on the `import.meta` line below, just delete
+   that one line and use the two constants above instead. */
+const IMPORT_ENV = (() => { try { return import.meta.env || {}; } catch (e) { return {}; } })(); // <-- deletable
+const PROC_ENV = (typeof process !== "undefined" && process.env) || {};
+const envVar = (...names) => {
+  for (const n of names) {
+    const v = IMPORT_ENV[n] || PROC_ENV[n];
+    if (v) return String(v);
+  }
+  return "";
+};
+
+const CLOUD_URL = (
+  SUPABASE_URL ||
+  envVar("VITE_SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_URL", "REACT_APP_SUPABASE_URL") ||
+  (typeof window !== "undefined" && window.POS_SUPABASE_URL) || ""
+).replace(/\/+$/, "");
+const CLOUD_KEY =
+  SUPABASE_ANON_KEY ||
+  envVar("VITE_SUPABASE_ANON_KEY", "NEXT_PUBLIC_SUPABASE_ANON_KEY", "REACT_APP_SUPABASE_ANON_KEY") ||
+  (typeof window !== "undefined" && window.POS_SUPABASE_ANON_KEY) || "";
 const CLOUD_ENABLED = Boolean(CLOUD_URL && CLOUD_KEY);
 const SYNC_INTERVAL_MS = (typeof window !== "undefined" && window.POS_SYNC_MS) || 15000;
+
+// Boot diagnostic — open DevTools (F12) → Console to see whether this build
+// is actually talking to Supabase. "cloud sync OFF" means logins and sales
+// will NOT travel between devices.
+if (typeof console !== "undefined") {
+  console.log(
+    CLOUD_ENABLED
+      ? `[POS] cloud sync ON → ${CLOUD_URL}`
+      : "[POS] cloud sync OFF — this device stores its own data only. Set SUPABASE_URL + SUPABASE_ANON_KEY."
+  );
+}
 
 const SYNC_KEYS = ["chai_reset_at", "chai_staff", "chai_orders", "chai_expenses", "chai_inventory", "chai_menu", "chai_restaurant"];
 // Keys holding arrays of records that several devices append to concurrently.
@@ -1781,9 +1818,23 @@ function UsersView({ staff, setStaff, currentUser, flash }) {
         </div>
       </Card>
 
+      {!CLOUD_ENABLED && (
+        <div className="flex items-start gap-2 px-4 py-3 rounded-xl text-xs" style={{ background: "#FDECE7", color: "#B2412B" }}>
+          <AlertTriangle size={14} className="shrink-0 mt-0.5" />
+          <span>
+            <b>Cloud sync is OFF — accounts are stored on this device only.</b> A staff login created here will
+            NOT work on another phone, tablet or computer. To share logins and sales across devices, add your
+            Supabase URL and anon key at the top of App.jsx (SUPABASE_URL / SUPABASE_ANON_KEY) and redeploy.
+          </span>
+        </div>
+      )}
+
       <div className="flex items-start gap-2 px-4 py-3 rounded-xl text-xs" style={{ background: "var(--surface2)", color: "var(--muted)" }}>
         <Lock size={14} className="shrink-0 mt-0.5" />
-        <span>Accounts are saved permanently. Created users will persist even if you close the app. Only the Super Admin role can manage accounts from this screen.</span>
+        <span>
+          Accounts are saved permanently {CLOUD_ENABLED ? "and synced to every device." : "on this device."} Only the
+          Super Admin role can manage accounts from this screen.
+        </span>
       </div>
     </div>
   );
