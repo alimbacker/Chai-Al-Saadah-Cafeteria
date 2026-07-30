@@ -70,12 +70,12 @@ const RESTAURANT_DEFAULT = {
    • Devices pull each other's changes every SYNC_INTERVAL_MS and on load.
    • Offline? Everything keeps saving locally and syncs when back online.
 ---------------------------------------------------------------------------- */
-/*  >>> PASTE YOUR TWO SUPABASE VALUES HERE <<<
-    While these are empty, every device keeps its OWN separate copy of the
-    staff list, orders and menu — which is why a login created on the office
-    PC is rejected on a phone. Fill them in and redeploy to fix that.       */
-const SUPABASE_URL = "";      // e.g. "https://abcd1234.supabase.co"
-const SUPABASE_ANON_KEY = ""; // the long "anon public" API key
+/*  Supabase cloud sync — CONFIGURED. Staff logins, orders, menu and settings
+    are shared across every device that loads this build. If these two values
+    are ever blanked out, each device silently falls back to storing its own
+    private copy again (which is what caused phone logins to be rejected).  */
+const SUPABASE_URL = "https://yjzohutjnwwfmdhmlcok.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inlqem9odXRqbnd3Zm1kaG1sY29rIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODIzNjUyODMsImV4cCI6MjA5Nzk0MTI4M30.iqtkUYgW6HLNtyfyemgPYFUNp2JlTqmceI20BjHwpmU";
 
 /* Environment variables are also accepted, so the key need not be committed.
    Supported names: VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY (Vite),
@@ -423,7 +423,24 @@ const ROLES = {
 // (In the deployed build these live in Supabase Auth.)
 const INITIAL_STAFF = [
   { id: "superadmin", pin: "1234", name: "Super Admin", role: "Super Admin" },
+
+  /* Accounts listed here are compiled into the app and exist on every device
+     even with no cloud connection. Once Supabase sync is on you don't need
+     them — create staff from the Users screen instead and they reach every
+     device within ~15 seconds. Kept only as a lockout escape hatch.
+     Roles: "Super Admin" | "Owner" | "Manager" | "Cashier" | "Kitchen".   */
+  // { id: "ramesh", pin: "5678", name: "Ramesh K.", role: "Cashier" },
 ];
+
+// Keep every built-in account present in the saved staff list. A stored account
+// always wins over the built-in with the same id, so a PIN you change from the
+// Users screen sticks. Note: a built-in account cannot be deleted permanently —
+// it reappears on reload. Remove its line above to get rid of it for good.
+const withBuiltIns = (list) => {
+  const have = new Set((Array.isArray(list) ? list : []).map((s) => String(s.id).toLowerCase()));
+  const missing = INITIAL_STAFF.filter((s) => !have.has(String(s.id).toLowerCase()));
+  return missing.length ? [...list, ...missing] : list;
+};
 
 /* --------------------------- COUNT-UP HOOK -------------------------------- */
 function useCountUp(value, duration = 650) {
@@ -506,7 +523,7 @@ export default function App() {
   const applyRemote = (key, json) => {
     try {
       const p = JSON.parse(json);
-      if (key === "chai_staff" && Array.isArray(p) && p.length > 0) setStaff(p);
+      if (key === "chai_staff" && Array.isArray(p) && p.length > 0) setStaff(withBuiltIns(p));
       else if (key === "chai_orders" && Array.isArray(p)) setOrders((prev) => mergeRecords(p, prev, "id", cloudResetAtRef.current));
       else if (key === "chai_expenses" && Array.isArray(p)) setExpenses((prev) => mergeRecords(p, prev, "id", cloudResetAtRef.current));
       else if (key === "chai_inventory" && Array.isArray(p)) setInventory(p);
@@ -542,7 +559,7 @@ export default function App() {
   useEffect(() => {
     (async () => {
       const raw_staff = await safeGet("chai_staff");
-      if (raw_staff) { try { const p = JSON.parse(raw_staff); if (Array.isArray(p) && p.length > 0) setStaff(p); } catch(e){} }
+      if (raw_staff) { try { const p = JSON.parse(raw_staff); if (Array.isArray(p) && p.length > 0) setStaff(withBuiltIns(p)); } catch(e){} }
 
       const raw_orders = await safeGet("chai_orders");
       if (raw_orders) { try { const p = JSON.parse(raw_orders); if (Array.isArray(p)) setOrders(p); } catch(e){} }
