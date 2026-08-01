@@ -1766,6 +1766,8 @@ function UsersView({ staff, setStaff, currentUser, flash }) {
   // Owner: can change PINs for staff — but not for Super Admin accounts.
   const isSuper = currentUser.role === "Super Admin";
   const canEditPin = (s) => isSuper || s.role !== "Super Admin";
+  // Owners never see Super Admin accounts — hidden from the list entirely.
+  const visibleStaff = isSuper ? staff : staff.filter((s) => s.role !== "Super Admin");
 
   const add = () => {
     const cleanId = id.trim().toLowerCase().replace(/\s+/g, "");
@@ -1819,9 +1821,9 @@ function UsersView({ staff, setStaff, currentUser, flash }) {
       </Card>}
 
       <Card pad="p-0">
-        <CardHead title="Staff Accounts" sub={`${staff.length} ${staff.length === 1 ? "account" : "accounts"}`} className="px-4 pt-4" />
+        <CardHead title="Staff Accounts" sub={`${visibleStaff.length} ${visibleStaff.length === 1 ? "account" : "accounts"}`} className="px-4 pt-4" />
         <div className="mt-2 divide-y" style={{ borderColor: "var(--line)" }}>
-          {staff.map((s) => (
+          {visibleStaff.map((s) => (
             <div key={s.id} className="px-4 py-3">
               <div className="flex items-center gap-3">
                 <div className="w-9 h-9 rounded-xl flex items-center justify-center text-sm font-bold shrink-0" style={{ background: "var(--surface2)", color: "var(--purple)" }}>{s.name[0]?.toUpperCase()}</div>
@@ -1830,11 +1832,7 @@ function UsersView({ staff, setStaff, currentUser, flash }) {
                   <div className="text-[11px]" style={{ color: "var(--muted)" }}>ID: {s.id} · PIN ••••</div>
                 </div>
                 {roleBadge(s.role)}
-                {canEditPin(s) ? (
-                  <button onClick={() => { setEditId(editId === s.id ? null : s.id); setNewPin(""); }} className="text-[11px] font-semibold px-2.5 py-1.5 rounded-lg" style={{ color: "var(--purple)", background: "var(--surface2)" }}>Change PIN</button>
-                ) : (
-                  <span className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ color: "var(--muted)", background: "var(--surface2)" }} title="Only the Super Admin can change this PIN"><Lock size={13} /></span>
-                )}
+                <button onClick={() => { setEditId(editId === s.id ? null : s.id); setNewPin(""); }} className="text-[11px] font-semibold px-2.5 py-1.5 rounded-lg" style={{ color: "var(--purple)", background: "var(--surface2)" }}>Change PIN</button>
                 {isSuper && <button onClick={() => remove(s.id)} className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ color: "#E6553A", background: "var(--surface2)" }} aria-label="Delete account"><Trash2 size={15} /></button>}
               </div>
               {editId === s.id && (
@@ -1863,8 +1861,9 @@ function UsersView({ staff, setStaff, currentUser, flash }) {
       <div className="flex items-start gap-2 px-4 py-3 rounded-xl text-xs" style={{ background: "var(--surface2)", color: "var(--muted)" }}>
         <Lock size={14} className="shrink-0 mt-0.5" />
         <span>
-          Accounts are saved permanently {CLOUD_ENABLED ? "and synced to every device." : "on this device."} The Super
-          Admin can add or remove accounts; the Owner can change staff PINs from here.
+          Accounts are saved permanently {CLOUD_ENABLED ? "and synced to every device." : "on this device."} {isSuper
+            ? "You can add or remove accounts and change any PIN from here."
+            : "You can change staff login PINs from here."}
         </span>
       </div>
     </div>
