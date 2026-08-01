@@ -891,6 +891,11 @@ export default function App() {
               <LogOut size={18} />
             </button>
           </div>
+          <a href="https://allbeesolutions.com/" target="_blank" rel="noopener noreferrer"
+            className="block text-center text-[10px] mt-1 pt-2 border-t opacity-70 hover:opacity-100 transition-opacity"
+            style={{ color: "rgba(255,255,255,0.6)", borderColor: "rgba(255,255,255,0.08)" }}>
+            Crafted with care by <span className="font-semibold" style={{ color: "#E6C15A" }}>Allbee Solutions</span>
+          </a>
         </div>
       </aside>
 
@@ -1046,6 +1051,9 @@ function Login({ onLogin, staff = [] }) {
         </div>
 
         <p className="mt-6 text-center text-[11px]" style={{ color: "#A79FC6" }}>VAT 105182070000001 • Dibba Municipality 09883</p>
+        <p className="mt-2 text-center text-[11px]" style={{ color: "#A79FC6" }}>
+          Crafted with care by <a href="https://allbeesolutions.com/" target="_blank" rel="noopener noreferrer" className="font-semibold hover:underline" style={{ color: "#6D28D9" }}>Allbee Solutions</a>
+        </p>
       </div>
     </div>
   );
