@@ -34,7 +34,74 @@ const RESTAURANT_DEFAULT = {
   servicePct: 0,
   receiptHeader: "Tax Invoice  •  فاتورة ضريبية",
   receiptFooter: "Thank you — Dhanyabad — شكراً لكم  •  Visit again!",
+  // How heavy the printed receipt is. Thermal heads burn thin/anti-aliased
+  // strokes very lightly, so we print bold, pure-black text by default.
+  // "normal" | "dark" | "max"
+  printDarkness: "dark",
 };
+
+/* ---- Print weight presets (see printStyle) --------------------------------
+   base    : body font size in px on the 80mm roll
+   weight  : body font-weight
+   stroke  : extra outline thickness in px (-webkit-text-stroke) — this is what
+             actually pushes more dots onto the paper on 203dpi thermal heads
+   rule    : thickness of the divider lines                                    */
+const PRINT_DENSITY = {
+  normal: { base: 12, weight: 600, stroke: 0, rule: 1 },
+  dark: { base: 13, weight: 700, stroke: 0.18, rule: 2 },
+  max: { base: 13.5, weight: 800, stroke: 0.4, rule: 2.5 },
+};
+const printStyle = (r) => PRINT_DENSITY[(r && r.printDarkness) || "dark"] || PRINT_DENSITY.dark;
+
+/* Send a finished HTML document to the printer through a hidden iframe, so the
+   POS screen itself is never part of the print job. Waits for the logo to
+   decode first, otherwise the roll comes out with a blank header.           */
+function printThermalHTML(html) {
+  const frame = document.createElement("iframe");
+  frame.setAttribute("aria-hidden", "true");
+  frame.style.cssText = "position:fixed;right:0;bottom:0;width:0;height:0;border:0;";
+  document.body.appendChild(frame);
+  const cw = frame.contentWindow;
+  cw.document.open(); cw.document.write(html); cw.document.close();
+  const fire = () => {
+    try { cw.focus(); cw.print(); } catch (e) { try { window.print(); } catch (_) {} }
+    setTimeout(() => { try { document.body.removeChild(frame); } catch (_) {} }, 1000);
+  };
+  const img = cw.document.querySelector("img.logo");
+  if (img && !img.complete) { img.onload = () => setTimeout(fire, 60); img.onerror = () => setTimeout(fire, 60); setTimeout(fire, 900); }
+  else setTimeout(fire, 150);
+}
+
+/* Settings → "Test print": one short slip at the current darkness so the
+   cashier can compare settings without ringing up a real order.            */
+function printDarknessTest(restaurant) {
+  const d = printStyle(restaurant);
+  const stroke = d.stroke ? `-webkit-text-stroke:${d.stroke}px #000;` : "";
+  const label = { normal: "NORMAL", dark: "DARK", max: "EXTRA DARK" }[restaurant.printDarkness || "dark"];
+  printThermalHTML(
+    `<!doctype html><html><head><meta charset="utf-8"><title>Print test</title><style>` +
+    `@page{size:80mm auto;margin:3mm}` +
+    `*{box-sizing:border-box;-webkit-print-color-adjust:exact;print-color-adjust:exact}` +
+    `body{font-family:Arial,'Helvetica Neue',Helvetica,sans-serif;color:#000;background:#fff;width:74mm;margin:0 auto;` +
+    `font-size:${d.base}px;font-weight:${d.weight};line-height:1.4;${stroke}-webkit-font-smoothing:none;font-variant-numeric:tabular-nums}` +
+    `.c{text-align:center}.dv{border-top:${d.rule}px dashed #000;margin:6px 0}` +
+    `img.logo{width:64px;height:auto;display:block;margin:0 auto 4px;filter:grayscale(1) contrast(1.6);image-rendering:pixelated}` +
+    `</style></head><body>` +
+    `<div class="c"><img class="logo" src="${LOGO_MONO}" alt=""/>` +
+    `<div style="font-weight:900;font-size:${d.base + 3}px;">${restaurant.name}</div>` +
+    `<div style="font-weight:900;">PRINT TEST &mdash; ${label}</div></div><div class="dv"></div>` +
+    `<div style="display:flex;justify-content:space-between;"><span>1 &times; Chicken Burger</span><span>8.00</span></div>` +
+    `<div style="display:flex;justify-content:space-between;"><span>1 &times; Zinger Burger</span><span>15.00</span></div>` +
+    `<div class="dv"></div>` +
+    `<div style="display:flex;justify-content:space-between;font-weight:900;"><span>GRAND TOTAL</span><span>AED 23.00</span></div>` +
+    `<div style="display:flex;justify-content:space-between;"><span>Paid &middot; Cash</span><span>AED 10.00</span></div>` +
+    `<div style="display:flex;justify-content:space-between;"><span>Paid &middot; UPI</span><span>AED 13.00</span></div>` +
+    `<div class="dv"></div><div class="c">ABCDEFGHIJ 0123456789<br>&#1601;&#1575;&#1578;&#1608;&#1585;&#1577; &#1590;&#1585;&#1610;&#1576;&#1610;&#1577;</div>` +
+    `<div class="c" style="margin-top:8px;font-weight:900;">If this is still faint, raise the</div>` +
+    `<div class="c" style="font-weight:900;">printer density in its driver too.</div>` +
+    `</body></html>`
+  );
+}
 
 /* ------------------------- CLOUD SYNC (multi-device) ----------------------
    To share users, orders, menu & settings across several devices, connect a
@@ -303,6 +370,46 @@ const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
 const aed = (n) => "AED " + round2(n).toFixed(2);
 const money = (n) => round2(n).toFixed(2);
 
+/* ------------------------- SPLIT PAYMENT HELPERS ---------------------------
+   An order pays with either a single method ("Cash" | "Card" | "UPI") or a
+   split — e.g. AED 50 cash + AED 50 UPI. A split order stores:
+     payment: { method: "Split", split: { Cash: 50, UPI: 50 }, tendered: 100 }
+   These helpers let the rest of the app (dashboard, Z report, exports,
+   receipt) treat both shapes the same way.                                   */
+const PAY_METHODS = ["Cash", "Card", "UPI"];
+
+// → [{ method, amount }] — one entry per method actually used.
+function paymentParts(order) {
+  const p = order.payment || {};
+  if (p.method === "Split" && p.split) {
+    const parts = PAY_METHODS
+      .map((m) => ({ method: m, amount: round2(p.split[m] || 0) }))
+      .filter((x) => x.amount > 0);
+    if (parts.length) return parts;
+  }
+  // Single-method order: the whole bill went on that one method.
+  return [{ method: p.method || "Cash", amount: round2(order.totals?.grandTotal || 0) }];
+}
+
+// Change due back — only ever from the cash portion.
+function changeDue(order) {
+  const p = order.payment || {};
+  const total = round2(order.totals?.grandTotal || 0);
+  if (p.method === "Split" && p.split) {
+    const paid = PAY_METHODS.reduce((s, m) => s + (Number(p.split[m]) || 0), 0);
+    return Math.max(0, round2(paid - total));
+  }
+  if (p.method === "Cash") return Math.max(0, round2((p.tendered || total) - total));
+  return 0;
+}
+
+// "Cash" | "Split: Cash 50.00 + UPI 50.00" — for order cards, CSV and Excel.
+function paymentLabel(order) {
+  const p = order.payment || {};
+  if (p.method !== "Split") return p.method || "Cash";
+  return "Split: " + paymentParts(order).map((x) => `${x.method} ${money(x.amount)}`).join(" + ");
+}
+
 function computeTotals(lines, discountMode, discountValue, serviceOn, servicePct) {
   const grossSubtotal = lines.reduce((s, l) => s + l.price * l.qty, 0);
   let discountAmt = discountMode === "percent"
@@ -532,7 +639,7 @@ export default function App() {
       else if (key === "chai_expenses" && Array.isArray(p)) setExpenses((prev) => mergeRecords(p, prev, "id", cloudResetAtRef.current));
       else if (key === "chai_inventory" && Array.isArray(p)) setInventory(p);
       else if (key === "chai_menu" && Array.isArray(p) && p.length > 0) setItems(p);
-      else if (key === "chai_restaurant" && p && typeof p === "object") setRestaurant(p);
+      else if (key === "chai_restaurant" && p && typeof p === "object") setRestaurant({ ...RESTAURANT_DEFAULT, ...p });
     } catch (e) { /* ignore malformed cloud value */ }
   };
 
@@ -575,7 +682,7 @@ export default function App() {
       if (raw_inv) { try { const p = JSON.parse(raw_inv); if (Array.isArray(p)) setInventory(p); } catch(e){} }
 
       const raw_rest = await safeGet("chai_restaurant");
-      if (raw_rest) { try { const p = JSON.parse(raw_rest); if (p && typeof p === "object") setRestaurant(p); } catch(e){} }
+      if (raw_rest) { try { const p = JSON.parse(raw_rest); if (p && typeof p === "object") setRestaurant({ ...RESTAURANT_DEFAULT, ...p }); } catch(e){} }
 
       const raw_menu = await safeGet("chai_menu");
       if (raw_menu) { try { const p = JSON.parse(raw_menu); if (Array.isArray(p) && p.length > 0) setItems(p); } catch(e){} }
@@ -666,6 +773,8 @@ export default function App() {
   const [notes, setNotes] = useState("");
   const [payMethod, setPayMethod] = useState("Cash");
   const [tendered, setTendered] = useState("");
+  // Split payment: how much of the bill goes on each method (e.g. 50 cash + 50 UPI)
+  const [split, setSplit] = useState({ Cash: "", Card: "", UPI: "" });
   const [posCat, setPosCat] = useState("all");
   const [posSearch, setPosSearch] = useState("");
 
@@ -708,7 +817,7 @@ export default function App() {
   function clearCart() {
     setLines([]); setOrderType("Dine In"); setTable(""); setCustName(""); setCustPhone("");
     setDiscMode("percent"); setDiscValue(""); setServiceOn(false); setNotes("");
-    setPayMethod("Cash"); setTendered("");
+    setPayMethod("Cash"); setTendered(""); setSplit({ Cash: "", Card: "", UPI: "" });
   }
 
   const totals = useMemo(
@@ -733,6 +842,23 @@ export default function App() {
   function charge() {
     if (lines.length === 0) { flash("Add items before charging", "warn"); return; }
     const t = computeTotals(lines, discMode, discValue, serviceOn, restaurant.servicePct);
+
+    // ---- Payment block (single method, or a split across Cash/Card/UPI) ----
+    let payment;
+    if (payMethod === "Split") {
+      const parts = {};
+      PAY_METHODS.forEach((m) => { const v = round2(split[m]); if (v > 0) parts[m] = v; });
+      const paid = round2(Object.values(parts).reduce((s, v) => s + v, 0));
+      if (Object.keys(parts).length < 2) { flash("Enter at least two payment methods for a split bill", "warn"); return; }
+      if (paid + 0.001 < t.grandTotal) {
+        flash(`Short by AED ${money(t.grandTotal - paid)} — split must cover the total`, "warn");
+        return;
+      }
+      payment = { method: "Split", split: parts, tendered: paid };
+    } else {
+      payment = { method: payMethod, tendered: payMethod === "Cash" ? (Number(tendered) || t.grandTotal) : t.grandTotal };
+    }
+
     const order = {
       // random suffix keeps ids unique even if two tills bill in the same millisecond
       id: "O" + Date.now() + "-" + Math.random().toString(36).slice(2, 7),
@@ -744,7 +870,7 @@ export default function App() {
       customer: { name: custName || "Walk-in", phone: custPhone },
       discount: { mode: discMode, value: Number(discValue) || 0 },
       serviceOn,
-      payment: { method: payMethod, tendered: payMethod === "Cash" ? (Number(tendered) || t.grandTotal) : t.grandTotal },
+      payment,
       notes,
       status: orderType === "Take Away" ? "Completed" : "Preparing",
       cashier: user?.name || "Administrator",
@@ -959,7 +1085,7 @@ export default function App() {
               discMode={discMode} setDiscMode={setDiscMode} discValue={discValue} setDiscValue={setDiscValue}
               serviceOn={serviceOn} setServiceOn={setServiceOn} servicePct={restaurant.servicePct}
               notes={notes} setNotes={setNotes} payMethod={payMethod} setPayMethod={setPayMethod}
-              tendered={tendered} setTendered={setTendered} totals={totals}
+              tendered={tendered} setTendered={setTendered} split={split} setSplit={setSplit} totals={totals}
               charge={charge} holdBill={holdBill} clearCart={clearCart} held={held} resumeBill={resumeBill}
             />
           )}
@@ -1080,7 +1206,9 @@ function Dashboard({ stats, todays, items, restaurant, dark, expensesToday = 0, 
 
   const payData = useMemo(() => {
     const m = {};
-    todays.filter((o) => o.status !== "Cancelled").forEach((o) => { m[o.payment.method] = (m[o.payment.method] || 0) + o.totals.grandTotal; });
+    // A split bill counts towards each method it actually used, not a "Split" slice.
+    todays.filter((o) => o.status !== "Cancelled").forEach((o) =>
+      paymentParts(o).forEach((p) => { m[p.method] = (m[p.method] || 0) + p.amount; }));
     return Object.entries(m).map(([name, value]) => ({ name, value: round2(value) }));
   }, [todays]);
 
@@ -1240,8 +1368,8 @@ function POS(props) {
     items, posCat, setPosCat, posSearch, setPosSearch, lines, addToCart, setQty, removeLine,
     orderType, setOrderType, table, setTable, custName, setCustName, custPhone, setCustPhone,
     discMode, setDiscMode, discValue, setDiscValue, serviceOn, setServiceOn, servicePct,
-    notes, setNotes, payMethod, setPayMethod, tendered, setTendered, totals, charge, holdBill,
-    clearCart, held, resumeBill,
+    notes, setNotes, payMethod, setPayMethod, tendered, setTendered, split, setSplit,
+    totals, charge, holdBill, clearCart, held, resumeBill,
   } = props;
 
   const q = posSearch.trim().toLowerCase();
@@ -1293,6 +1421,16 @@ function POS(props) {
     );
   };
   const change = payMethod === "Cash" && tendered ? round2((Number(tendered) || 0) - totals.grandTotal) : 0;
+
+  // ---- Split payment maths (e.g. 50 cash + 50 UPI on a 100 bill) ----
+  const splitPaid = round2(PAY_METHODS.reduce((s, m) => s + (Number(split?.[m]) || 0), 0));
+  const splitLeft = round2(totals.grandTotal - splitPaid); // >0 short, <0 over-paid (change)
+  const setSplitAmt = (m, v) => setSplit((p) => ({ ...p, [m]: v }));
+  // "Rest" button: drop whatever is still unpaid onto this method.
+  const fillRest = (m) => {
+    const others = PAY_METHODS.filter((x) => x !== m).reduce((s, x) => s + (Number(split?.[x]) || 0), 0);
+    setSplitAmt(m, String(Math.max(0, round2(totals.grandTotal - others))));
+  };
 
   return (
     <div className="flex flex-col lg:flex-row h-full">
@@ -1428,14 +1566,45 @@ function POS(props) {
           </div>
 
           {/* Payment */}
-          <div className="grid grid-cols-3 gap-1.5 pt-1">
-            {[["Cash", Banknote], ["Card", CreditCard], ["UPI", Smartphone]].map(([m, Ic]) => (
+          <div className="grid grid-cols-4 gap-1.5 pt-1">
+            {[["Cash", Banknote], ["Card", CreditCard], ["UPI", Smartphone], ["Split", Layers]].map(([m, Ic]) => (
               <button key={m} onClick={() => setPayMethod(m)} className="flex flex-col items-center gap-1 py-2 rounded-xl text-xs font-semibold transition-all"
                 style={{ background: payMethod === m ? "var(--purple)" : "var(--surface)", color: payMethod === m ? "#fff" : "var(--muted)", border: "1px solid var(--line)" }}>
                 <Ic size={16} />{m}
               </button>
             ))}
           </div>
+
+          {/* Split payment — part cash, part card, part UPI */}
+          {payMethod === "Split" && lines.length > 0 && (
+            <div className="rounded-xl p-2.5 space-y-2" style={{ background: "var(--surface)", border: "1px solid var(--line)" }}>
+              <div className="flex items-center justify-between text-[11px] font-semibold" style={{ color: "var(--muted)" }}>
+                <span>Split this bill across methods</span>
+                <button onClick={() => setSplit({ Cash: "", Card: "", UPI: "" })} className="underline">Reset</button>
+              </div>
+              {[["Cash", Banknote], ["Card", CreditCard], ["UPI", Smartphone]].map(([m, Ic]) => (
+                <div key={m} className="flex items-center gap-2">
+                  <span className="flex items-center gap-1.5 text-xs font-semibold w-16 shrink-0" style={{ color: "var(--ink)" }}>
+                    <Ic size={14} />{m}
+                  </span>
+                  <input value={split?.[m] ?? ""} onChange={(e) => setSplitAmt(m, e.target.value)} type="number" min="0" placeholder="0.00"
+                    className="flex-1 min-w-0 px-3 py-2 rounded-lg text-sm outline-none tnum"
+                    style={{ background: "var(--surface2)", border: "1px solid var(--line)", color: "var(--ink)" }} />
+                  <button onClick={() => fillRest(m)} className="px-2 py-2 rounded-lg text-[11px] font-bold shrink-0"
+                    style={{ background: "var(--surface2)", color: "var(--purple)", border: "1px solid var(--line)" }} title={`Put the remaining amount on ${m}`}>
+                    Rest
+                  </button>
+                </div>
+              ))}
+              <div className="flex items-center justify-between text-xs pt-1.5 border-t" style={{ borderColor: "var(--line)" }}>
+                <span style={{ color: "var(--muted)" }}>Entered <b className="tnum" style={{ color: "var(--ink)" }}>{money(splitPaid)}</b> of {money(totals.grandTotal)}</span>
+                <span className="font-bold tnum" style={{ color: splitLeft > 0 ? "#E6553A" : splitLeft < 0 ? "#1F9D6B" : "#1F9D6B" }}>
+                  {splitLeft > 0 ? `Remaining ${money(splitLeft)}` : splitLeft < 0 ? `Change ${money(-splitLeft)}` : "Balanced ✓"}
+                </span>
+              </div>
+            </div>
+          )}
+
           {payMethod === "Cash" && lines.length > 0 && (
             <div className="flex items-center gap-2">
               <input value={tendered} onChange={(e) => setTendered(e.target.value)} type="number" placeholder="Cash received"
@@ -1489,6 +1658,7 @@ function Orders({ orders, setStatus, reprint }) {
                   <StatusPill status={o.status} />
                 </div>
                 <div className="text-xs mt-0.5" style={{ color: "var(--muted)" }}>{o.customer.name} • {o.type}{o.table ? ` · Table ${o.table}` : ""}</div>
+                <div className="text-[11px] mt-0.5 font-semibold" style={{ color: "var(--gold)" }}>{paymentLabel(o)}</div>
               </div>
               <div className="text-right">
                 <div className="font-bold tnum" style={{ color: "var(--ink)" }}>{aed(o.totals.grandTotal)}</div>
@@ -2178,7 +2348,7 @@ function Reports({ orders, todays, items, restaurant, expenses = [] }) {
   );
 
   const byPay = useMemo(() => {
-    const m = {}; done.forEach((o) => { m[o.payment.method] = (m[o.payment.method] || 0) + o.totals.grandTotal; });
+    const m = {}; done.forEach((o) => paymentParts(o).forEach((p) => { m[p.method] = (m[p.method] || 0) + p.amount; }));
     return Object.entries(m).map(([k, v]) => ({ method: k, value: round2(v) }));
   }, [done]);
 
@@ -2284,7 +2454,7 @@ function Reports({ orders, todays, items, restaurant, expenses = [] }) {
       o.ref, new Date(o.createdAt).toLocaleString("en-GB"), o.customer.name, o.type,
       o.lines.map((l) => `${l.qty}x ${l.name}`).join("; "),
       money(o.totals.grossSubtotal), money(o.totals.discountAmt), money(o.totals.netAmount),
-      money(o.totals.vatAmount), money(o.totals.grandTotal), o.payment.method, o.status,
+      money(o.totals.vatAmount), money(o.totals.grandTotal), paymentLabel(o), o.status,
     ]));
     const csv = rows.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
     download(new Blob([csv], { type: "text/csv" }), `chai-sales-${range}.csv`);
@@ -2296,7 +2466,7 @@ function Reports({ orders, todays, items, restaurant, expenses = [] }) {
       Type: o.type, Table: o.table, Items: o.lines.map((l) => `${l.qty}x ${l.name}`).join("; "),
       Subtotal: round2(o.totals.grossSubtotal), Discount: round2(o.totals.discountAmt),
       Net: round2(o.totals.netAmount), VAT: round2(o.totals.vatAmount), Total: round2(o.totals.grandTotal),
-      Payment: o.payment.method, Status: o.status,
+      Payment: paymentLabel(o), Status: o.status,
     })));
     XLSX.utils.book_append_sheet(wb, ws1, "Orders");
     const ws2 = XLSX.utils.json_to_sheet(itemSales.map((i) => ({ Item: i.name, Qty: i.qty, Revenue: round2(i.revenue) })));
@@ -2701,15 +2871,15 @@ function Reports({ orders, todays, items, restaurant, expenses = [] }) {
 
       {/* ---- Hidden 80mm thermal Z Report — only visible when printing ---- */}
       {typeof document !== "undefined" && createPortal(
-        <div id="print-zreport" style={{ width: "74mm", margin: 0, background: "#fff", color: "#000", fontFamily: "'Courier New', monospace", fontSize: 12, lineHeight: 1.35, boxSizing: "border-box" }}>
+        <div id="print-zreport" style={{ width: "74mm", margin: 0, background: "#fff", color: "#000", fontFamily: "Arial, 'Helvetica Neue', Helvetica, sans-serif", fontWeight: printStyle(restaurant).weight, fontSize: printStyle(restaurant).base, lineHeight: 1.35, boxSizing: "border-box", WebkitTextStroke: printStyle(restaurant).stroke ? `${printStyle(restaurant).stroke}px #000` : undefined, fontVariantNumeric: "tabular-nums" }}>
           {/* Header — identical to the product bill */}
           <div style={{ textAlign: "center" }}>
-            <img src={LOGO_MONO} alt="" style={{ width: 58, height: "auto", display: "block", margin: "0 auto 4px" }} />
-            <div style={{ fontWeight: 700, fontSize: 14 }}>{restaurant.name}</div>
+            <img src={LOGO_MONO} alt="" style={{ width: 64, height: "auto", display: "block", margin: "0 auto 4px", filter: "grayscale(1) contrast(1.6)", imageRendering: "pixelated" }} />
+            <div style={{ fontWeight: 900, fontSize: 15 }}>{restaurant.name}</div>
             <div dir="rtl" style={{ fontSize: 12 }}>{restaurant.arabicName}</div>
-            <div style={{ fontSize: 10 }}>{restaurant.address1}<br />{restaurant.address2}</div>
-            <div style={{ fontSize: 10 }}>Tel/هاتف: {restaurant.phone1}</div>
-            <div style={{ fontSize: 10, fontWeight: 700 }}>VAT/الرقم الضريبي: {restaurant.vat}</div>
+            <div style={{ fontSize: 11 }}>{restaurant.address1}<br />{restaurant.address2}</div>
+            <div style={{ fontSize: 11 }}>Tel/هاتف: {restaurant.phone1}</div>
+            <div style={{ fontSize: 11, fontWeight: 900 }}>VAT/الرقم الضريبي: {restaurant.vat}</div>
           </div>
           <ZSec>Z REPORT • تقرير نهاية اليوم</ZSec>
           <div style={{ display: "flex", justifyContent: "space-between" }}>
@@ -2814,6 +2984,31 @@ function SettingsView({ restaurant, setRestaurant, dark, setDark, resetDemo, fla
           <Field label="Currency"><input value={f.currency} onChange={(e) => set("currency", e.target.value)} className="modal-input" /></Field>
           <Field label="Receipt footer" full><input value={f.receiptFooter} onChange={(e) => set("receiptFooter", e.target.value)} className="modal-input" /></Field>
         </div>
+
+        {/* Print darkness — thermal heads burn thin text very lightly */}
+        <div className="mt-4 p-3 rounded-xl" style={{ background: "var(--surface2)" }}>
+          <div className="flex items-center gap-2 text-sm font-semibold mb-1" style={{ color: "var(--ink)" }}>
+            <Printer size={15} /> Print darkness
+          </div>
+          <div className="text-xs mb-2.5" style={{ color: "var(--muted)" }}>
+            How heavy the printed bill is. Start on <b>Dark</b>; if the roll still looks faint, try <b>Extra dark</b> and also raise the density setting in your printer's driver.
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {[["normal", "Normal"], ["dark", "Dark (recommended)"], ["max", "Extra dark"]].map(([id, lbl]) => {
+              const on = (f.printDarkness || "dark") === id;
+              return (
+                <button key={id} onClick={() => set("printDarkness", id)} className="px-3.5 py-2 rounded-xl text-xs font-bold"
+                  style={{ background: on ? "var(--purple)" : "var(--surface)", color: on ? "#fff" : "var(--muted)", border: "1px solid var(--line)" }}>
+                  {lbl}
+                </button>
+              );
+            })}
+            <button onClick={() => printDarknessTest(f)} className="px-3.5 py-2 rounded-xl text-xs font-bold flex items-center gap-1.5"
+              style={{ background: "var(--surface)", color: "var(--gold)", border: "1px solid var(--line)" }}>
+              <Printer size={13} /> Test print
+            </button>
+          </div>
+        </div>
         <div className="flex items-center justify-between mt-4 px-3 py-2.5 rounded-xl" style={{ background: "var(--surface2)" }}>
           <div className="flex items-center gap-2 text-sm" style={{ color: "var(--ink)" }}>{dark ? <Moon size={16} /> : <Sun size={16} />} Dark mode</div>
           <button onClick={() => setDark((d) => !d)} className="relative w-11 h-6 rounded-full transition-all" style={{ background: dark ? "var(--purple)" : "var(--line)" }}>
@@ -2841,7 +3036,10 @@ function Receipt({ order, restaurant, onClose, flash }) {
     order.lines.forEach((l) => { s += `${l.qty} x ${l.name}  ${money(l.price * l.qty)}\n`; });
     s += `\nSubtotal/المجموع الفرعي: ${money(t.grossSubtotal)} AED\n`;
     if (t.discountAmt > 0) s += `Discount/الخصم: -${money(t.discountAmt)} AED\n`;
-    s += `Net/الصافي: ${money(t.netAmount)} AED\nVAT 5%/الضريبة: ${money(t.vatAmount)} AED\nGRAND TOTAL/الإجمالي: ${money(t.grandTotal)} AED\nPaid/الدفع: ${order.payment.method} (${PAY_AR[order.payment.method] || order.payment.method})\n\n${restaurant.receiptFooter}`;
+    s += `Net/الصافي: ${money(t.netAmount)} AED\nVAT 5%/الضريبة: ${money(t.vatAmount)} AED\nGRAND TOTAL/الإجمالي: ${money(t.grandTotal)} AED\n`;
+    paymentParts(order).forEach((p) => { s += `Paid/الدفع: ${p.method} (${PAY_AR[p.method] || p.method}) ${money(p.amount)} AED\n`; });
+    if (changeDue(order) > 0) s += `Change/المبلغ المتبقي: ${money(changeDue(order))} AED\n`;
+    s += `\n${restaurant.receiptFooter}`;
     return s;
   }, [order, restaurant]);
 
@@ -2850,17 +3048,50 @@ function Receipt({ order, restaurant, onClose, flash }) {
   const print = () => {
     const esc = (s) => String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
     const dtStr = dt.toLocaleDateString("en-GB") + " " + dt.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+
+    /* ---- WHY THIS RECEIPT PRINTS DARK ------------------------------------
+       A thermal head only burns the dots the browser rasterises as solid
+       black. Hairline fonts (Courier New), small type and anti-aliased grey
+       edges all come out faint. So we print with:
+         · a solid sans face at a heavy weight instead of hairline Courier
+         · -webkit-text-stroke, which physically thickens every glyph
+         · -webkit-font-smoothing:none, so edges stay pure black, not grey
+         · bigger type, pure #000 and print-color-adjust:exact
+       Adjustable per printer in Settings → Print darkness.               */
+    const d = printStyle(restaurant);
+    const stroke = d.stroke ? `-webkit-text-stroke:${d.stroke}px #000;` : "";
+    const fSm = d.base - 2;      // secondary lines (address, meta)
+    const fAr = d.base - 2.5;    // Arabic sub-labels
+    const rule = `${d.rule}px dashed #000`;
+
     const bi = (en, ar, val, o = {}) =>
-      `<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;${o.bold ? "font-weight:700;" : ""}${o.top ? "border-top:1px solid #000;padding-top:4px;margin-top:2px;" : ""}"><span style="line-height:1.15;">${en}${ar ? `<br><span dir="rtl" style="font-size:8px;color:#000;">${ar}</span>` : ""}</span><span style="white-space:nowrap;text-align:right;">${val}</span></div>`;
-    const itemRows = order.lines.map((l) => `<div style="display:flex;justify-content:space-between;padding:1px 0;"><span>${l.qty} &times; ${esc(l.name)}</span><span>${money(l.price * l.qty)}</span></div>`).join("");
+      `<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;${o.bold ? `font-weight:${Math.min(900, d.weight + 100)};` : ""}${o.top ? `border-top:${d.rule}px solid #000;padding-top:4px;margin-top:3px;` : ""}"><span style="line-height:1.15;">${en}${ar ? `<br><span dir="rtl" style="font-size:${fAr}px;color:#000;">${ar}</span>` : ""}</span><span style="white-space:nowrap;text-align:right;">${val}</span></div>`;
+    const itemRows = order.lines.map((l) => `<div style="display:flex;justify-content:space-between;padding:2px 0;"><span>${l.qty} &times; ${esc(l.name)}</span><span>${money(l.price * l.qty)}</span></div>`).join("");
+
+    // One "Paid" line per method — a split bill prints Cash and UPI separately.
+    const parts = paymentParts(order);
+    const paidRows =
+      (parts.length > 1 ? `<div style="font-weight:${Math.min(900, d.weight + 100)};">Split Payment <span dir="rtl" style="font-size:${fAr}px;">&#1583;&#1601;&#1593; &#1605;&#1602;&#1587;&#1617;&#1605;</span></div>` : "") +
+      parts.map((p) => bi(`Paid &middot; ${esc(p.method)}`, `${PAY_AR[p.method] || ""}`, `AED ${money(p.amount)}`)).join("") +
+      (changeDue(order) > 0 ? bi("Change", "&#1575;&#1604;&#1605;&#1576;&#1604;&#1594; &#1575;&#1604;&#1605;&#1578;&#1576;&#1602;&#1610;", `AED ${money(changeDue(order))}`) : "");
+
     const html =
-      `<!doctype html><html><head><meta charset="utf-8"><title>Receipt ${order.ref}</title><style>@page{size:80mm auto;margin:3mm}*{box-sizing:border-box}body{font-family:'Courier New',monospace;color:#000;width:74mm;margin:0 auto;font-size:12px;line-height:1.35}.c{text-align:center}.dv{border-top:1px dashed #000;margin:6px 0}img.logo{width:58px;height:auto;display:block;margin:0 auto 4px}</style></head><body>` +
-      `<div class="c"><img class="logo" src="${LOGO_MONO}" alt=""/><div style="font-weight:700;font-size:14px;">${esc(restaurant.name)}</div><div dir="rtl" style="font-size:12px;">${esc(restaurant.arabicName)}</div><div style="font-size:10px;">${esc(restaurant.address1)}<br>${esc(restaurant.address2)}</div><div style="font-size:10px;">Tel/&#1607;&#1575;&#1578;&#1601;: ${esc(restaurant.phone1)}</div><div style="font-size:10px;font-weight:700;">VAT/&#1575;&#1604;&#1585;&#1602;&#1605; &#1575;&#1604;&#1590;&#1585;&#1610;&#1576;&#1610;: ${esc(restaurant.vat)}</div></div>` +
-      `<div style="border-top:1px dashed #000;border-bottom:1px dashed #000;text-align:center;font-weight:700;margin:6px 0;padding:3px 0;">${esc(restaurant.receiptHeader)}</div>` +
+      `<!doctype html><html><head><meta charset="utf-8"><title>Receipt ${order.ref}</title><style>` +
+      `@page{size:80mm auto;margin:3mm}` +
+      `*{box-sizing:border-box;-webkit-print-color-adjust:exact;print-color-adjust:exact;color-adjust:exact}` +
+      `body{font-family:Arial,'Helvetica Neue',Helvetica,'Liberation Sans',sans-serif;color:#000;background:#fff;width:74mm;margin:0 auto;` +
+      `font-size:${d.base}px;font-weight:${d.weight};line-height:1.35;${stroke}` +
+      `-webkit-font-smoothing:none;font-smooth:never;text-rendering:geometricPrecision;font-variant-numeric:tabular-nums}` +
+      `b,strong{font-weight:${Math.min(900, d.weight + 100)}}` +
+      `.c{text-align:center}.dv{border-top:${rule};margin:6px 0}` +
+      `img.logo{width:64px;height:auto;display:block;margin:0 auto 4px;filter:grayscale(1) contrast(1.6);image-rendering:pixelated}` +
+      `</style></head><body>` +
+      `<div class="c"><img class="logo" src="${LOGO_MONO}" alt=""/><div style="font-weight:900;font-size:${d.base + 3}px;">${esc(restaurant.name)}</div><div dir="rtl" style="font-size:${d.base}px;">${esc(restaurant.arabicName)}</div><div style="font-size:${fSm}px;">${esc(restaurant.address1)}<br>${esc(restaurant.address2)}</div><div style="font-size:${fSm}px;">Tel/&#1607;&#1575;&#1578;&#1601;: ${esc(restaurant.phone1)}</div><div style="font-size:${fSm}px;font-weight:900;">VAT/&#1575;&#1604;&#1585;&#1602;&#1605; &#1575;&#1604;&#1590;&#1585;&#1610;&#1576;&#1610;: ${esc(restaurant.vat)}</div></div>` +
+      `<div style="border-top:${d.rule}px solid #000;border-bottom:${d.rule}px solid #000;text-align:center;font-weight:900;margin:6px 0;padding:4px 0;">${esc(restaurant.receiptHeader)}</div>` +
       `<div style="display:flex;justify-content:space-between;"><span>Order #: <b>${order.ref}</b></span><span>${esc(order.type)}${order.table ? " &middot; T" + esc(order.table) : ""}</span></div>` +
       `<div style="display:flex;justify-content:space-between;"><span>Items: ${order.totals.itemCount}</span><span>${dtStr}</span></div>` +
-      `<div>Customer: ${esc(order.customer.name || "—")}</div><div class="dv"></div>` +
-      `<div style="display:flex;justify-content:space-between;font-weight:700;font-size:10px;"><span>DESCRIPTION</span><span>TOTAL</span></div>${itemRows}<div class="dv"></div>` +
+      `<div>Customer: ${esc(order.customer.name || "&mdash;")}</div><div class="dv"></div>` +
+      `<div style="display:flex;justify-content:space-between;font-weight:900;font-size:${fSm}px;"><span>DESCRIPTION</span><span>TOTAL</span></div>${itemRows}<div class="dv"></div>` +
       bi("Subtotal", "&#1575;&#1604;&#1605;&#1580;&#1605;&#1608;&#1593; &#1575;&#1604;&#1601;&#1585;&#1593;&#1610;", `AED ${money(t.grossSubtotal)}`) +
       (t.discountAmt > 0 ? bi("Discount", "&#1575;&#1604;&#1582;&#1589;&#1605;", `&minus; ${money(t.discountAmt)}`) : "") +
       (t.serviceAmt > 0 ? bi("Service", "&#1585;&#1587;&#1608;&#1605; &#1575;&#1604;&#1582;&#1583;&#1605;&#1577;", `AED ${money(t.serviceAmt)}`) : "") +
@@ -2868,23 +3099,9 @@ function Receipt({ order, restaurant, onClose, flash }) {
       bi("VAT (5%)", "&#1590;&#1585;&#1610;&#1576;&#1577; &#1575;&#1604;&#1602;&#1610;&#1605;&#1577; &#1575;&#1604;&#1605;&#1590;&#1575;&#1601;&#1577;", `AED ${money(t.vatAmount)}`) +
       bi("GRAND TOTAL", "&#1575;&#1604;&#1573;&#1580;&#1605;&#1575;&#1604;&#1610; &#1575;&#1604;&#1593;&#1575;&#1605;", `AED ${money(t.grandTotal)}`, { bold: true, top: true }) +
       `<div class="dv"></div>` +
-      bi(`Paid &middot; ${esc(order.payment.method)}`, `${PAY_AR[order.payment.method] || ""}`, `AED ${money(order.payment.method === "Cash" ? order.payment.tendered : t.grandTotal)}`) +
-      (order.payment.method === "Cash" ? bi("Change", "&#1575;&#1604;&#1605;&#1576;&#1604;&#1594; &#1575;&#1604;&#1605;&#1578;&#1576;&#1602;&#1610;", `AED ${money(Math.max(0, order.payment.tendered - t.grandTotal))}`) : "") +
-      `<div class="c" style="margin-top:10px;"><div>Served by: ${esc(order.cashier)}</div><div style="font-weight:700;margin-top:4px;">${esc(restaurant.receiptFooter)}</div></div></body></html>`;
-
-    const frame = document.createElement("iframe");
-    frame.setAttribute("aria-hidden", "true");
-    frame.style.cssText = "position:fixed;right:0;bottom:0;width:0;height:0;border:0;";
-    document.body.appendChild(frame);
-    const cw = frame.contentWindow;
-    cw.document.open(); cw.document.write(html); cw.document.close();
-    const fire = () => {
-      try { cw.focus(); cw.print(); } catch (e) { try { window.print(); } catch (_) {} }
-      setTimeout(() => { try { document.body.removeChild(frame); } catch (_) {} }, 1000);
-    };
-    const img = cw.document.querySelector("img.logo");
-    if (img && !img.complete) { img.onload = () => setTimeout(fire, 60); img.onerror = () => setTimeout(fire, 60); setTimeout(fire, 900); }
-    else setTimeout(fire, 150);
+      paidRows +
+      `<div class="c" style="margin-top:10px;"><div>Served by: ${esc(order.cashier)}</div><div style="font-weight:900;margin-top:4px;">${esc(restaurant.receiptFooter)}</div></div></body></html>`;
+    printThermalHTML(html);
   };
 
   return (
@@ -2924,8 +3141,11 @@ function Receipt({ order, restaurant, onClose, flash }) {
           <div className="border-t border-dashed border-gray-400 mt-2 pt-1.5 text-[11px] space-y-1">
             <div className="font-bold">VAT Summary <span dir="rtl" className="text-gray-500" style={{ fontSize: 9 }}>ملخص الضريبة</span></div>
             <BiRow en={`5% on ${money(t.netAmount)}`} ar={`٥٪ على ${money(t.netAmount)}`} val={money(t.vatAmount)} />
-            <BiRow en={`Paid · ${order.payment.method}`} ar={`الدفع · ${PAY_AR[order.payment.method] || order.payment.method}`} val={`AED ${money(order.payment.method === "Cash" ? order.payment.tendered : t.grandTotal)}`} />
-            {order.payment.method === "Cash" && <BiRow en="Change" ar="المبلغ المتبقي" val={`AED ${money(Math.max(0, order.payment.tendered - t.grandTotal))}`} />}
+            {paymentParts(order).length > 1 && <div className="font-bold">Split Payment <span dir="rtl" className="text-gray-500" style={{ fontSize: 9 }}>دفع مقسّم</span></div>}
+            {paymentParts(order).map((p) => (
+              <BiRow key={p.method} en={`Paid · ${p.method}`} ar={`الدفع · ${PAY_AR[p.method] || p.method}`} val={`AED ${money(p.amount)}`} />
+            ))}
+            {changeDue(order) > 0 && <BiRow en="Change" ar="المبلغ المتبقي" val={`AED ${money(changeDue(order))}`} />}
           </div>
           <div className="text-center text-[11px] mt-3">
             <div>Served by / قدمها: {order.cashier}</div>
@@ -3135,6 +3355,19 @@ function StyleBlock() {
         #print-receipt, #print-receipt * { visibility: visible !important; }
         #print-receipt { position: fixed; left: 0; top: 0; width: 80mm; max-height:none !important; box-shadow:none; border-radius:0; }
         .no-print { display: none !important; }
+        /* Thermal heads under-burn thin, anti-aliased, grey-ish text. Force a
+           solid face, heavy weight and pure black so the roll comes out dark. */
+        #print-receipt, #print-receipt *, #print-zreport, #print-zreport * {
+          color: #000 !important;
+          font-family: Arial, 'Helvetica Neue', Helvetica, 'Liberation Sans', sans-serif !important;
+          -webkit-font-smoothing: none !important;
+          -webkit-print-color-adjust: exact !important;
+          print-color-adjust: exact !important;
+          text-shadow: none !important;
+        }
+        #print-receipt { font-weight: 700 !important; font-size: 13px !important; }
+        #print-receipt .text-gray-500, #print-zreport .text-gray-500 { color: #000 !important; }
+        #print-receipt [class*="border-dashed"] { border-color: #000 !important; border-top-width: 2px !important; }
         /* Z Report printing: hide the whole app, show only the thermal sheet */
         body.printing-z .app-root { display: none !important; }
         body.printing-z #print-zreport { display: block !important; }
