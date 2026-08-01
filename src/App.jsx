@@ -415,7 +415,7 @@ const GOLD_GRAD = "linear-gradient(135deg,#E6C15A 0%,#C19A2B 50%,#9C7A1E 100%)";
 
 const ROLES = {
   "Super Admin": ["users"],
-  Owner: ["dashboard", "pos", "orders", "kitchen", "menu", "inventory", "expenses", "reports", "settings"],
+  Owner: ["dashboard", "pos", "orders", "kitchen", "menu", "inventory", "expenses", "reports", "users", "settings"],
   Manager: ["dashboard", "pos", "orders", "kitchen", "menu", "inventory", "expenses", "reports", "settings"],
   Cashier: ["pos", "orders", "dashboard", "expenses"],
   "Kitchen Staff": ["kitchen", "orders"],
@@ -1762,6 +1762,10 @@ function UsersView({ staff, setStaff, currentUser, flash }) {
   const [editId, setEditId] = useState(null);
   const [newPin, setNewPin] = useState("");
   const superCount = staff.filter((s) => s.role === "Super Admin").length;
+  // Super Admin: full control (create/delete + any PIN).
+  // Owner: can change PINs for staff — but not for Super Admin accounts.
+  const isSuper = currentUser.role === "Super Admin";
+  const canEditPin = (s) => isSuper || s.role !== "Super Admin";
 
   const add = () => {
     const cleanId = id.trim().toLowerCase().replace(/\s+/g, "");
@@ -1782,6 +1786,8 @@ function UsersView({ staff, setStaff, currentUser, flash }) {
     flash("Account removed");
   };
   const savePin = (sid) => {
+    const target = staff.find((x) => x.id === sid);
+    if (target && !canEditPin(target)) { flash("Only the Super Admin can change a Super Admin PIN", "err"); return; }
     if (newPin.trim().length < 4) { flash("PIN must be at least 4 digits", "err"); return; }
     setStaff((xs) => xs.map((x) => x.id === sid ? { ...x, pin: newPin.trim() } : x));
     setEditId(null); setNewPin("");
@@ -1795,7 +1801,7 @@ function UsersView({ staff, setStaff, currentUser, flash }) {
 
   return (
     <div className="p-4 md:p-6 space-y-4">
-      <Card>
+      {isSuper && <Card>
         <CardHead title="Create Staff Login" sub="Only the Super Admin can add accounts. Everyone signs in with their ID + PIN." />
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-3">
           <Field label="Staff ID"><input value={id} onChange={(e) => setId(e.target.value)} placeholder="e.g. ramesh" className="modal-input" /></Field>
@@ -1810,7 +1816,7 @@ function UsersView({ staff, setStaff, currentUser, flash }) {
         <button onClick={add} className="mt-3 inline-flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-bold text-white" style={{ background: SIDEBAR_GRAD }}>
           <Plus size={16} /> Create Account
         </button>
-      </Card>
+      </Card>}
 
       <Card pad="p-0">
         <CardHead title="Staff Accounts" sub={`${staff.length} ${staff.length === 1 ? "account" : "accounts"}`} className="px-4 pt-4" />
@@ -1824,8 +1830,12 @@ function UsersView({ staff, setStaff, currentUser, flash }) {
                   <div className="text-[11px]" style={{ color: "var(--muted)" }}>ID: {s.id} · PIN ••••</div>
                 </div>
                 {roleBadge(s.role)}
-                <button onClick={() => { setEditId(editId === s.id ? null : s.id); setNewPin(""); }} className="text-[11px] font-semibold px-2.5 py-1.5 rounded-lg" style={{ color: "var(--purple)", background: "var(--surface2)" }}>PIN</button>
-                <button onClick={() => remove(s.id)} className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ color: "#E6553A", background: "var(--surface2)" }} aria-label="Delete account"><Trash2 size={15} /></button>
+                {canEditPin(s) ? (
+                  <button onClick={() => { setEditId(editId === s.id ? null : s.id); setNewPin(""); }} className="text-[11px] font-semibold px-2.5 py-1.5 rounded-lg" style={{ color: "var(--purple)", background: "var(--surface2)" }}>Change PIN</button>
+                ) : (
+                  <span className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ color: "var(--muted)", background: "var(--surface2)" }} title="Only the Super Admin can change this PIN"><Lock size={13} /></span>
+                )}
+                {isSuper && <button onClick={() => remove(s.id)} className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ color: "#E6553A", background: "var(--surface2)" }} aria-label="Delete account"><Trash2 size={15} /></button>}
               </div>
               {editId === s.id && (
                 <div className="flex items-center gap-2 mt-2.5 pl-12">
@@ -1853,8 +1863,8 @@ function UsersView({ staff, setStaff, currentUser, flash }) {
       <div className="flex items-start gap-2 px-4 py-3 rounded-xl text-xs" style={{ background: "var(--surface2)", color: "var(--muted)" }}>
         <Lock size={14} className="shrink-0 mt-0.5" />
         <span>
-          Accounts are saved permanently {CLOUD_ENABLED ? "and synced to every device." : "on this device."} Only the
-          Super Admin role can manage accounts from this screen.
+          Accounts are saved permanently {CLOUD_ENABLED ? "and synced to every device." : "on this device."} The Super
+          Admin can add or remove accounts; the Owner can change staff PINs from here.
         </span>
       </div>
     </div>
@@ -2809,18 +2819,6 @@ function SettingsView({ restaurant, setRestaurant, dark, setDark, resetDemo, fla
         </div>
       </Card>
 
-      <Card>
-        <CardHead title="Security & Roles" sub="What each role can access" />
-        <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-          {Object.entries(ROLES).map(([role, perms]) => (
-            <div key={role} className="p-3 rounded-xl" style={{ background: "var(--surface2)" }}>
-              <div className="font-bold text-sm mb-1" style={{ color: "var(--purple)" }}>{role}</div>
-              <div className="text-xs capitalize" style={{ color: "var(--muted)" }}>{perms.join(" · ")}</div>
-            </div>
-          ))}
-        </div>
-        <p className="text-xs mt-3" style={{ color: "var(--muted)" }}>In the deployed app, roles are enforced by Supabase Auth with hashed passwords, session timeout, and audit logs.</p>
-      </Card>
     </div>
   );
 }
