@@ -373,6 +373,10 @@ const EXPENSE_CATS = [
   { id: "other", name: "Other", emoji: "🧾" },
 ];
 
+const EXPENSE_UNITS = ["pcs", "kg", "g", "L", "ml", "pack", "box", "dozen", "carton"];
+// "Tomatoes x5 kg = 20.00; Onions x3 kg = 9.00" — used by the CSV + Excel exports
+const expItemsText = (e) => (e.items || []).map((i) => `${i.name} x${i.qty}${i.unit ? " " + i.unit : ""}${Number(i.price) > 0 ? ` = ${Number(i.price).toFixed(2)}` : ""}`).join("; ");
+
 function seedExpenses() {
   const rows = [
     { h: 7, m: 30, cat: "ingredients", amt: 240, method: "Cash", vendor: "Veg & meat market" },
@@ -1866,6 +1870,17 @@ function Expenses({ expenses, setExpenses, flash, user }) {
   const [date, setDate] = useState(todayStr());
   const [range, setRange] = useState("today");
 
+  // ---- Itemised purchase rows (product / qty / unit / price) ----
+  const emptyItem = () => ({ key: "I" + Date.now() + Math.random().toString(16).slice(2), name: "", qty: "", unit: "pcs", price: "" });
+  const [draftItems, setDraftItems] = useState([emptyItem()]);
+  const [openId, setOpenId] = useState(null); // which entry in the list is expanded
+  const editItem = (key, patch) => setDraftItems((rs) => rs.map((r) => (r.key === key ? { ...r, ...patch } : r)));
+  const addItemRow = () => setDraftItems((rs) => [...rs, emptyItem()]);
+  const delItemRow = (key) => setDraftItems((rs) => (rs.length > 1 ? rs.filter((r) => r.key !== key) : [emptyItem()]));
+  const itemsTotal = round2(draftItems.reduce((s, r) => s + (parseFloat(r.price) || 0), 0));
+  // Keep Amount in sync with the item prices (it stays editable afterwards)
+  useEffect(() => { if (itemsTotal > 0) setAmount(String(itemsTotal)); }, [itemsTotal]);
+
   const inRange = (e) => {
     const d = new Date(e.createdAt), now = new Date();
     if (range === "all") return true;
@@ -1883,12 +1898,15 @@ function Expenses({ expenses, setExpenses, flash, user }) {
   })();
 
   const add = () => {
-    const amt = round2(amount);
+    const amt = round2(amount) || itemsTotal;
     if (!amt || amt <= 0) { flash("Enter a valid amount", "err"); return; }
+    const items = draftItems
+      .filter((r) => r.name.trim())
+      .map((r) => ({ name: r.name.trim(), qty: parseFloat(r.qty) || 1, unit: r.unit, price: round2(r.price) || 0 }));
     const createdAt = (date === todayStr() ? new Date() : new Date(`${date}T12:00:00`)).toISOString();
-    const exp = { id: "E" + Date.now(), cat, amount: amt, method, vendor: vendor.trim(), note: "", createdAt };
+    const exp = { id: "E" + Date.now(), cat, amount: amt, method, vendor: vendor.trim(), items, note: "", createdAt };
     setExpenses((xs) => [exp, ...xs]);
-    setAmount(""); setVendor("");
+    setAmount(""); setVendor(""); setDraftItems([emptyItem()]);
     flash("Expense added");
   };
   // Tombstone instead of hard delete: the `deleted` flag syncs to other
@@ -1896,9 +1914,9 @@ function Expenses({ expenses, setExpenses, flash, user }) {
   const remove = (id) => { setExpenses((xs) => xs.map((e) => e.id === id ? { ...e, deleted: true, updatedAt: new Date().toISOString() } : e)); flash("Expense removed"); };
 
   const exportCSV = () => {
-    const rows = [["Date", "Time", "Category", "Vendor/For", "Method", "Amount (AED)"]];
-    filtered.forEach((e) => { const d = new Date(e.createdAt); rows.push([d.toLocaleDateString("en-GB"), d.toLocaleTimeString("en-GB"), EXPENSE_CATS.find((c) => c.id === e.cat)?.name || "Other", e.vendor, e.method, money(e.amount)]); });
-    rows.push(["", "", "", "", "TOTAL", money(total)]);
+    const rows = [["Date", "Time", "Category", "Shop/Vendor", "Items (product x qty = price)", "Method", "Amount (AED)"]];
+    filtered.forEach((e) => { const d = new Date(e.createdAt); rows.push([d.toLocaleDateString("en-GB"), d.toLocaleTimeString("en-GB"), EXPENSE_CATS.find((c) => c.id === e.cat)?.name || "Other", e.vendor, expItemsText(e), e.method, money(e.amount)]); });
+    rows.push(["", "", "", "", "", "TOTAL", money(total)]);
     const csv = rows.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
     download(new Blob([csv], { type: "text/csv" }), `chai-expenses-${range}.csv`);
   };
@@ -1926,13 +1944,42 @@ function Expenses({ expenses, setExpenses, flash, user }) {
               {["Cash", "Card", "Bank"].map((m) => <option key={m} value={m}>{m}</option>)}
             </select>
           </Field>
-          <Field label="Vendor / For (optional)" full>
-            <input value={vendor} onChange={(e) => setVendor(e.target.value)} onKeyDown={(e) => e.key === "Enter" && add()} placeholder="e.g. Veg market, electricity bill, staff salary" className="modal-input" />
+          <Field label="Shop / Vendor (optional)" full>
+            <input value={vendor} onChange={(e) => setVendor(e.target.value)} onKeyDown={(e) => e.key === "Enter" && add()} placeholder="e.g. Al Madina Veg Market, Lulu, ADNOC, electricity bill" className="modal-input" />
           </Field>
           <Field label="Date">
             <input type="date" value={date} onChange={(e) => setDate(e.target.value)} className="modal-input" />
           </Field>
         </div>
+
+        {/* Itemised purchase — what exactly was bought */}
+        <div className="mt-4 rounded-xl p-3" style={{ background: "var(--surface2)", border: "1px dashed var(--line)" }}>
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-xs font-semibold flex items-center gap-1.5" style={{ color: "var(--ink)" }}><ShoppingBag size={13} /> Items purchased (optional)</span>
+            {itemsTotal > 0 && <span className="text-xs font-bold tnum" style={{ color: "var(--purple)" }}>Items total: AED {money(itemsTotal)}</span>}
+          </div>
+          <div className="hidden sm:grid grid-cols-12 gap-2 px-0.5 mb-1 text-[10px] font-semibold uppercase tracking-wide" style={{ color: "var(--muted)" }}>
+            <span className="col-span-5">Product</span><span className="col-span-2">Qty</span><span className="col-span-2">Unit</span><span className="col-span-2">Price (AED)</span><span className="col-span-1" />
+          </div>
+          <div className="space-y-2">
+            {draftItems.map((r) => (
+              <div key={r.key} className="grid grid-cols-12 gap-2 items-center">
+                <input value={r.name} onChange={(e) => editItem(r.key, { name: e.target.value })} placeholder="e.g. Tomatoes" className="modal-input col-span-12 sm:col-span-5" />
+                <input type="number" inputMode="decimal" min="0" value={r.qty} onChange={(e) => editItem(r.key, { qty: e.target.value })} placeholder="1" className="modal-input tnum col-span-3 sm:col-span-2" />
+                <select value={r.unit} onChange={(e) => editItem(r.key, { unit: e.target.value })} className="modal-input col-span-4 sm:col-span-2">
+                  {EXPENSE_UNITS.map((u) => <option key={u} value={u}>{u}</option>)}
+                </select>
+                <input type="number" inputMode="decimal" min="0" value={r.price} onChange={(e) => editItem(r.key, { price: e.target.value })} onKeyDown={(e) => e.key === "Enter" && add()} placeholder="0.00" className="modal-input tnum col-span-4 sm:col-span-2" />
+                <button onClick={() => delItemRow(r.key)} className="col-span-1 w-8 h-8 rounded-lg flex items-center justify-center justify-self-end" style={{ color: "#E6553A", background: "var(--surface)" }} aria-label="Remove item"><X size={14} /></button>
+              </div>
+            ))}
+          </div>
+          <div className="flex items-center justify-between mt-2 flex-wrap gap-2">
+            <button onClick={addItemRow} className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-semibold" style={{ background: "var(--surface)", color: "var(--purple)", border: "1px solid var(--line)" }}><Plus size={13} /> Add item</button>
+            {itemsTotal > 0 && <span className="text-[11px]" style={{ color: "var(--muted)" }}>Amount auto-filled from item prices — you can still edit it</span>}
+          </div>
+        </div>
+
         <button onClick={add} className="mt-3 inline-flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-bold text-white" style={{ background: SIDEBAR_GRAD }}>
           <Plus size={16} /> Add Expense
         </button>
@@ -1982,15 +2029,33 @@ function Expenses({ expenses, setExpenses, flash, user }) {
           <div className="mt-2 divide-y thin-scroll overflow-y-auto" style={{ borderColor: "var(--line)", maxHeight: 460 }}>
             {filtered.length === 0 ? <div className="p-4"><Empty msg="Nothing logged yet — add your first expense above" /></div> : filtered.map((e) => {
               const c = EXPENSE_CATS.find((x) => x.id === e.cat) || { name: "Other", emoji: "🧾" };
+              const hasItems = Array.isArray(e.items) && e.items.length > 0;
+              const open = openId === e.id;
               return (
-                <div key={e.id} className="flex items-center gap-3 px-4 py-3">
-                  <div className="w-9 h-9 rounded-xl flex items-center justify-center text-lg shrink-0" style={{ background: "var(--surface2)" }}>{c.emoji}</div>
-                  <div className="min-w-0 flex-1">
-                    <div className="text-sm font-semibold truncate" style={{ color: "var(--ink)" }}>{c.name}{e.vendor ? <span className="font-normal" style={{ color: "var(--muted)" }}> · {e.vendor}</span> : null}</div>
-                    <div className="text-[11px] flex items-center gap-1.5 mt-0.5" style={{ color: "var(--muted)" }}><PayIcon m={e.method} /> {e.method} · {fmtDate(e.createdAt)}</div>
+                <div key={e.id}>
+                  <div className={`flex items-center gap-3 px-4 py-3 ${hasItems ? "cursor-pointer" : ""}`} onClick={() => hasItems && setOpenId(open ? null : e.id)}>
+                    <div className="w-9 h-9 rounded-xl flex items-center justify-center text-lg shrink-0" style={{ background: "var(--surface2)" }}>{c.emoji}</div>
+                    <div className="min-w-0 flex-1">
+                      <div className="text-sm font-semibold truncate" style={{ color: "var(--ink)" }}>{c.name}{e.vendor ? <span className="font-normal" style={{ color: "var(--muted)" }}> · {e.vendor}</span> : null}</div>
+                      <div className="text-[11px] flex items-center gap-1.5 mt-0.5" style={{ color: "var(--muted)" }}><PayIcon m={e.method} /> {e.method} · {fmtDate(e.createdAt)}{hasItems ? <span style={{ color: "var(--purple)" }}>· {e.items.length} item{e.items.length > 1 ? "s" : ""} {open ? "▴" : "▾"}</span> : null}</div>
+                      {hasItems && !open && <div className="text-[11px] truncate mt-0.5" style={{ color: "var(--muted)" }}>🛒 {e.items.map((i) => `${i.name} ×${i.qty}${i.unit && i.unit !== "pcs" ? " " + i.unit : ""}`).join(", ")}</div>}
+                    </div>
+                    <div className="text-sm font-bold tnum shrink-0" style={{ color: "var(--ink)" }}>AED {money(e.amount)}</div>
+                    <button onClick={(ev) => { ev.stopPropagation(); remove(e.id); }} className="shrink-0 w-8 h-8 rounded-lg flex items-center justify-center" style={{ color: "#E6553A", background: "var(--surface2)" }} aria-label="Delete expense"><Trash2 size={15} /></button>
                   </div>
-                  <div className="text-sm font-bold tnum shrink-0" style={{ color: "var(--ink)" }}>AED {money(e.amount)}</div>
-                  <button onClick={() => remove(e.id)} className="shrink-0 w-8 h-8 rounded-lg flex items-center justify-center" style={{ color: "#E6553A", background: "var(--surface2)" }} aria-label="Delete expense"><Trash2 size={15} /></button>
+                  {hasItems && open && (
+                    <div className="px-4 pb-3">
+                      <div className="rounded-xl overflow-hidden" style={{ border: "1px solid var(--line)" }}>
+                        {e.items.map((i, idx) => (
+                          <div key={idx} className="flex items-center justify-between gap-3 px-3 py-2 text-xs" style={{ background: idx % 2 ? "var(--surface)" : "var(--surface2)", color: "var(--ink)" }}>
+                            <span className="truncate flex-1">{i.name}</span>
+                            <span className="tnum shrink-0" style={{ color: "var(--muted)" }}>×{i.qty} {i.unit}</span>
+                            <span className="tnum font-semibold shrink-0 w-20 text-right">{Number(i.price) > 0 ? money(i.price) : "—"}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
               );
             })}
@@ -2223,7 +2288,7 @@ function Reports({ orders, todays, items, restaurant, expenses = [] }) {
       Date: new Date(e.createdAt).toLocaleDateString("en-GB"),
       Time: new Date(e.createdAt).toLocaleTimeString("en-GB"),
       Category: EXPENSE_CATS.find((c) => c.id === e.cat)?.name || "Other",
-      Vendor: e.vendor, Method: e.method, Amount: round2(e.amount),
+      Vendor: e.vendor, Items: expItemsText(e), Method: e.method, Amount: round2(e.amount),
     })));
     XLSX.utils.book_append_sheet(wb, ws3, "Expenses");
     // Day-wise summary sheet
