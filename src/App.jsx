@@ -33,6 +33,9 @@ const RESTAURANT_DEFAULT = {
   license: "09883 — Dibba Municipality",
   currency: "AED",
   servicePct: 0,
+  // Billing refuses to ring up more than Inventory holds. Managers can
+  // switch this off when the shelf count is ahead of the system.
+  blockOverStock: true,
   receiptHeader: "Tax Invoice  •  فاتورة ضريبية",
   receiptFooter: "Thank you — Dhanyabad — شكراً لكم  •  Visit again!",
   // How heavy the printed receipt is. Thermal heads burn thin/anti-aliased
@@ -416,12 +419,21 @@ const normName = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, " "
 // Packaging and portion words describe the tin, not the drink inside it.
 // Ignoring them lets "7 Up" on the menu still find "7 UP CAN 330" in stock.
 const NOISE_WORDS = new Set([
-  "can", "cans", "bottle", "bottles", "tin", "pcs", "pc", "piece", "pieces",
-  "pack", "packet", "box", "glass", "cup", "plate", "set", "portion",
+  "can", "cans", "canned", "bottle", "bottles", "bottled", "tin", "tinned",
+  "pcs", "pc", "piece", "pieces", "pack", "packet", "pkt", "box", "glass",
+  "cup", "plate", "set", "portion",
   "small", "medium", "big", "large", "regular", "reg", "half", "full",
   "s", "m", "l", "b",
+  // bare measurement words
+  "ml", "lt", "ltr", "litre", "liter", "cl", "oz", "gm", "gms", "kg", "g",
 ]);
-const nameTokens = (s) => normName(s).split(" ").filter((t) => t && !NOISE_WORDS.has(t));
+
+// "330ML" is the same size as "330", and ".500ML" is the same bottle as "500".
+// Trimming the measurement letters off a number lets both sides compare equal.
+const UNIT_SUFFIX = /^(\d+)(ml|l|lt|ltr|litre|liter|cl|oz|g|gm|gms|kg|pc|pcs)$/;
+const nameTokens = (s) => normName(s).split(" ")
+  .map((t) => { const m = t.match(UNIT_SUFFIX); return m ? m[1] : t; })
+  .filter((t) => t && !NOISE_WORDS.has(t));
 
 /* How well a menu name matches a raw-material name. 0 means no match at all. */
 function matchScore(menuName, materialName) {
@@ -475,6 +487,22 @@ function recipeTotals(orderLines, items, inventory) {
     resolveRecipe(it, inventory).forEach((r) => { need[r.id] = round2((need[r.id] || 0) + r.qty * l.qty); });
   });
   return need;
+}
+
+/* How many of this item stock can still cover. null means the item isn't
+   linked to any raw material, so there's nothing to run out of.
+   Pass `claimed` (material already spoken for by the open bill) to get what's
+   left on top of the current cart.                                          */
+function stockOnHand(item, inventory, claimed = {}) {
+  const recipe = resolveRecipe(item, inventory);
+  if (!recipe.length) return null;
+  let n = Infinity;
+  recipe.forEach((r) => {
+    const ing = (inventory || []).find((i) => i.id === r.id);
+    if (!ing || r.qty <= 0) return;
+    n = Math.min(n, Math.floor(round2(ing.stock - (claimed[r.id] || 0)) / r.qty));
+  });
+  return n === Infinity ? null : Math.max(0, n);
 }
 
 /* ----------------------------- HELPERS ------------------------------------ */
@@ -923,20 +951,43 @@ export default function App() {
   }
 
   /* ----------------------------- CART OPS -------------------------------- */
+  // Billing is capped by what's actually on the shelf. The manager can lift the
+  // cap in Settings when the physical count is ahead of the system.
+  const blockOverStock = restaurant.blockOverStock !== false;
+  // Raw material the open bill has already claimed.
+  const cartUse = useMemo(() => recipeTotals(lines, items, inventory), [lines, items, inventory]);
+  // Units of each menu item still sellable on top of what's in the cart.
+  const stockLeft = useMemo(() => {
+    const m = {};
+    items.forEach((it) => { m[it.id] = stockOnHand(it, inventory, cartUse); });
+    return m;
+  }, [items, inventory, cartUse]);
+
   function addToCart(item) {
     if (!item.available) { flash(`${item.name} is marked unavailable`, "warn"); return; }
+    if (blockOverStock && stockLeft[item.id] === 0) {
+      const held = stockOnHand(item, inventory);
+      flash(held === 0 ? `${item.name} is out of stock` : `Only ${held} in stock — all of them are on this bill already`, "warn");
+      return;
+    }
     setLines((prev) => {
       const ex = prev.find((l) => l.itemId === item.id);
       if (ex) return prev.map((l) => l.itemId === item.id ? { ...l, qty: l.qty + 1 } : l);
       return [...prev, { itemId: item.id, name: item.name, price: item.price, cost: item.cost, qty: 1 }];
     });
   }
-  const setQty = (itemId, delta) =>
+  const setQty = (itemId, delta) => {
+    if (delta > 0 && blockOverStock && stockLeft[itemId] === 0) {
+      const it = items.find((i) => i.id === itemId);
+      flash(`Only ${stockOnHand(it, inventory)} ${it?.name || "in stock"} — that's all of them`, "warn");
+      return;
+    }
     setLines((prev) => prev.flatMap((l) => {
       if (l.itemId !== itemId) return [l];
       const q = l.qty + delta;
       return q <= 0 ? [] : [{ ...l, qty: q }];
     }));
+  };
   const removeLine = (itemId) => setLines((prev) => prev.filter((l) => l.itemId !== itemId));
 
   function clearCart() {
@@ -973,6 +1024,10 @@ export default function App() {
 
   function charge() {
     if (lines.length === 0) { flash("Add items before charging", "warn"); return; }
+    if (blockOverStock) {
+      const over = stockShortages(lines);
+      if (over.length) { flash(`Not enough stock for ${over.join(", ")} — top it up in Inventory`, "warn"); return; }
+    }
     const t = computeTotals(lines, discMode, discValue, serviceOn, restaurant.servicePct);
 
     // ---- Payment block (single method, or a split across Cash/Card/UPI) ----
@@ -1233,6 +1288,7 @@ export default function App() {
               notes={notes} setNotes={setNotes} payMethod={payMethod} setPayMethod={setPayMethod}
               tendered={tendered} setTendered={setTendered} split={split} setSplit={setSplit} totals={totals}
               charge={charge} holdBill={holdBill} clearCart={clearCart} held={held} resumeBill={resumeBill}
+              stockLeft={stockLeft} blockOverStock={blockOverStock}
             />
           )}
           {view === "orders" && <Orders orders={orders} setStatus={setStatus} reprint={setReceiptOrder} />}
@@ -1522,7 +1578,7 @@ function POS(props) {
     orderType, setOrderType, table, setTable, custName, setCustName, custPhone, setCustPhone,
     discMode, setDiscMode, discValue, setDiscValue, serviceOn, setServiceOn, servicePct,
     notes, setNotes, payMethod, setPayMethod, tendered, setTendered, split, setSplit,
-    totals, charge, holdBill, clearCart, held, resumeBill,
+    totals, charge, holdBill, clearCart, held, resumeBill, stockLeft = {}, blockOverStock = true,
   } = props;
 
   const CATEGORIES = useCategories();
@@ -1533,21 +1589,34 @@ function POS(props) {
   const popularItems = items.filter((i) => POPULAR.has(i.name));
   const catCount = (id) => items.filter((i) => i.cat === id).length;
 
-  const ItemCard = ({ it }) => (
-    <button onClick={() => addToCart(it)} disabled={!it.available}
-      className="group relative text-left rounded-2xl p-3.5 transition-all item-card disabled:opacity-50 flex flex-col"
-      style={{ background: "var(--surface)", border: "1px solid var(--line)", minHeight: 108 }}>
-      <div className="flex items-start justify-between mb-1.5">
-        <span className="text-lg leading-none">{CATEGORIES.find((c) => c.id === it.cat)?.emoji}</span>
-        {!it.available && <span className="text-[9px] font-bold px-1.5 py-0.5 rounded" style={{ background: "#E6553A", color: "#fff" }}>SOLD OUT</span>}
-      </div>
-      <div className="text-[15px] font-semibold leading-snug line-clamp-2 flex-1" style={{ color: "var(--ink)" }}>{it.name}</div>
-      <div className="mt-2 flex items-center justify-between">
-        <span className="text-base font-bold tnum" style={{ color: "var(--purple)" }}>{money(it.price)}<span className="text-[10px] font-medium ml-0.5" style={{ color: "var(--muted)" }}>AED</span></span>
-        <span className="w-8 h-8 rounded-full flex items-center justify-center transition-all group-hover:scale-110" style={{ background: GOLD_GRAD, color: "#2E1065" }}><Plus size={16} strokeWidth={2.5} /></span>
-      </div>
-    </button>
-  );
+  const ItemCard = ({ it }) => {
+    const left = stockLeft[it.id];          // null/undefined = not tracked
+    const tracked = typeof left === "number";
+    const out = tracked && left === 0;
+    const low = tracked && left > 0 && left <= 5;
+    return (
+      <button onClick={() => addToCart(it)} disabled={!it.available || (blockOverStock && out)}
+        className="group relative text-left rounded-2xl p-3.5 transition-all item-card disabled:opacity-50 flex flex-col"
+        style={{ background: "var(--surface)", border: "1px solid var(--line)", minHeight: 108 }}>
+        <div className="flex items-start justify-between mb-1.5 gap-1">
+          <span className="text-lg leading-none">{CATEGORIES.find((c) => c.id === it.cat)?.emoji}</span>
+          {!it.available ? (
+            <span className="text-[9px] font-bold px-1.5 py-0.5 rounded" style={{ background: "#E6553A", color: "#fff" }}>SOLD OUT</span>
+          ) : out ? (
+            <span className="text-[9px] font-bold px-1.5 py-0.5 rounded" style={{ background: "#E6553A", color: "#fff" }}>NO STOCK</span>
+          ) : tracked ? (
+            <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-full tnum whitespace-nowrap"
+              style={{ background: low ? "#FBF3DE" : "var(--surface2)", color: low ? "#8A6A11" : "var(--muted)" }}>{left} left</span>
+          ) : null}
+        </div>
+        <div className="text-[15px] font-semibold leading-snug line-clamp-2 flex-1" style={{ color: "var(--ink)" }}>{it.name}</div>
+        <div className="mt-2 flex items-center justify-between">
+          <span className="text-base font-bold tnum" style={{ color: "var(--purple)" }}>{money(it.price)}<span className="text-[10px] font-medium ml-0.5" style={{ color: "var(--muted)" }}>AED</span></span>
+          <span className="w-8 h-8 rounded-full flex items-center justify-center transition-all group-hover:scale-110" style={{ background: GOLD_GRAD, color: "#2E1065" }}><Plus size={16} strokeWidth={2.5} /></span>
+        </div>
+      </button>
+    );
+  };
 
   const Grid = ({ list }) => (
     <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-4 gap-3">
@@ -1685,7 +1754,9 @@ function POS(props) {
               <div className="flex items-center gap-1.5">
                 <QtyBtn onClick={() => setQty(l.itemId, -1)}><Minus size={13} /></QtyBtn>
                 <span className="w-6 text-center text-sm font-bold tnum">{l.qty}</span>
-                <QtyBtn onClick={() => setQty(l.itemId, 1)}><Plus size={13} /></QtyBtn>
+                <span style={{ opacity: blockOverStock && stockLeft[l.itemId] === 0 ? 0.35 : 1 }}>
+                  <QtyBtn onClick={() => setQty(l.itemId, 1)}><Plus size={13} /></QtyBtn>
+                </span>
                 <button onClick={() => removeLine(l.itemId)} className="ml-1 p-1 rounded-lg" style={{ color: "#E6553A" }}><Trash2 size={15} /></button>
               </div>
             </div>
@@ -3438,7 +3509,21 @@ function SettingsView({ restaurant, setRestaurant, dark, setDark, resetDemo, fla
             </button>
           </div>
         </div>
-        <div className="flex items-center justify-between mt-4 px-3 py-2.5 rounded-xl" style={{ background: "var(--surface2)" }}>
+        <div className="flex items-center justify-between gap-3 mt-4 px-3 py-2.5 rounded-xl" style={{ background: "var(--surface2)" }}>
+          <div className="min-w-0">
+            <div className="flex items-center gap-2 text-sm" style={{ color: "var(--ink)" }}><Package size={16} /> Stop billing at zero stock</div>
+            <div className="text-xs mt-0.5" style={{ color: "var(--muted)" }}>
+              Cashiers can't ring up more than Inventory holds. Switch off if you'd rather sell now and correct the count afterwards.
+            </div>
+          </div>
+          <button
+            onClick={() => { const v = f.blockOverStock === false; setF((p) => ({ ...p, blockOverStock: v })); setRestaurant((r) => ({ ...r, blockOverStock: v })); }}
+            className="relative w-11 h-6 rounded-full transition-all shrink-0"
+            style={{ background: f.blockOverStock === false ? "var(--line)" : "var(--purple)" }}>
+            <span className="absolute top-0.5 w-5 h-5 rounded-full bg-white transition-all" style={{ left: f.blockOverStock === false ? "2px" : "22px" }} />
+          </button>
+        </div>
+        <div className="flex items-center justify-between mt-3 px-3 py-2.5 rounded-xl" style={{ background: "var(--surface2)" }}>
           <div className="flex items-center gap-2 text-sm" style={{ color: "var(--ink)" }}>{dark ? <Moon size={16} /> : <Sun size={16} />} Dark mode</div>
           <button onClick={() => setDark((d) => !d)} className="relative w-11 h-6 rounded-full transition-all" style={{ background: dark ? "var(--purple)" : "var(--line)" }}>
             <span className="absolute top-0.5 w-5 h-5 rounded-full bg-white transition-all" style={{ left: dark ? "22px" : "2px" }} />
