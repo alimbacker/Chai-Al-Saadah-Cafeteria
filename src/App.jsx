@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useMemo } from "react";
+import { useState, useEffect, useRef, useMemo, createContext, useContext } from "react";
 import { createPortal } from "react-dom";
 import {
   LayoutDashboard, Utensils, ClipboardList, Package, BarChart3, Settings as SettingsIcon,
@@ -7,6 +7,7 @@ import {
   TrendingUp, Wallet, Users, ShoppingBag, Percent, Hash, User, Pause, Play, Pencil,
   Save, Flame, Bell, Moon, Sun, RotateCcw, FileSpreadsheet, Download, Eye, Phone,
   MapPin, Store, Coins, Calendar, Layers, Coffee, Search as SearchIcon, FileText, Receipt as ReceiptIcon, Lock, TrendingDown,
+  ChevronUp, ChevronDown,
 } from "lucide-react";
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell,
@@ -182,7 +183,7 @@ if (typeof console !== "undefined") {
   );
 }
 
-const SYNC_KEYS = ["chai_reset_at", "chai_staff", "chai_orders", "chai_expenses", "chai_inventory", "chai_menu", "chai_restaurant"];
+const SYNC_KEYS = ["chai_reset_at", "chai_staff", "chai_orders", "chai_expenses", "chai_inventory", "chai_menu", "chai_categories", "chai_restaurant"];
 // Keys holding arrays of records that several devices append to concurrently.
 // These are merged per record (by the given id field) instead of overwritten.
 const CLOUD_MERGE_KEYS = { chai_orders: "id", chai_expenses: "id" };
@@ -230,7 +231,11 @@ function mergeRecords(remoteArr, localArr, idKey, notBefore = 0) {
 /* ----------------------------- MENU DATA ---------------------------------- */
 /* Imported from the uploaded menu (prices in AED, VAT-inclusive).            */
 
-const CATEGORIES = [
+/* The categories the app ships with. From here on this list is only the
+   STARTING POINT — the live list lives in App state (key "chai_categories"),
+   is saved on the device, synced to every other till, and can be added to,
+   renamed, re-ordered or removed from Menu → Categories.                    */
+const DEFAULT_CATEGORIES = [
   { id: "soup", name: "Soup", emoji: "🍲" },
   { id: "chaat", name: "Chaat", emoji: "🫓" },
   { id: "sandwich", name: "Sandwich", emoji: "🥪" },
@@ -247,6 +252,32 @@ const CATEGORIES = [
   { id: "shake", name: "Milkshakes", emoji: "🥤" },
   { id: "juice", name: "Fresh Juice", emoji: "🧃" },
 ];
+
+/* Every screen reads the live category list from this context. Each component
+   does `const CATEGORIES = useCategories();` at the top, so a category added
+   in Menu shows up in POS, the item editor and the reports immediately.     */
+const CategoriesContext = createContext(DEFAULT_CATEGORIES);
+const useCategories = () => useContext(CategoriesContext);
+
+// Emojis offered in the category picker — tap one instead of hunting for the
+// emoji keyboard on a till screen. Any emoji can still be typed by hand.
+const CATEGORY_EMOJIS = [
+  "🍲", "🫓", "🥪", "🍖", "🍔", "🥟", "🍜", "🍚", "🍗", "🍛", "🍱", "🥤", "🧃",
+  "☕", "🫖", "🧋", "🍵", "🥛", "🧁", "🍰", "🍦", "🍩", "🍪", "🥐", "🍞", "🥗",
+  "🍟", "🌯", "🌮", "🍕", "🍝", "🥘", "🍳", "🧆", "🍢", "🐟", "🦐", "🥩", "🍿",
+  "🍫", "🍬", "🥜", "🍉", "🧊", "🚬", "🛍️", "📦", "⭐", "🍽️",
+];
+
+// Turn a typed name into a stable id: "Cold Drinks" → "cold-drinks".
+// Ids never change once created, so old orders keep pointing at the right
+// category even after it is renamed.
+function slugCat(name, taken = []) {
+  let base = String(name).toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  if (!base) base = "cat";
+  let id = base, n = 2;
+  while (taken.includes(id)) id = `${base}-${n++}`;
+  return id;
+}
 
 const RAW_MENU = [
   // Soup
@@ -524,9 +555,17 @@ const ROLES = {
   "Super Admin": ["users"],
   Owner: ["dashboard", "pos", "orders", "kitchen", "menu", "inventory", "expenses", "reports", "users", "settings"],
   Manager: ["dashboard", "pos", "orders", "kitchen", "menu", "inventory", "expenses", "reports", "settings"],
-  Cashier: ["pos", "orders", "dashboard", "expenses"],
+  Cashier: ["pos", "orders", "dashboard", "expenses", "reports"],
   "Kitchen Staff": ["kitchen", "orders"],
 };
+
+/* Who may see money that isn't sales — food cost, margins, profit, expenses.
+   Roles NOT listed here get the sales-only view: takings, VAT, payment
+   method totals, item and category sales, and the full Z Report — everything
+   a cashier needs to close the drawer, and nothing about what the food cost.
+   To let cashiers see profit as well, just add "Cashier" to this array.     */
+const FINANCE_ROLES = ["Owner", "Manager", "Super Admin"];
+const canSeeProfit = (role) => FINANCE_ROLES.includes(role);
 
 // Staff accounts — sign in with an ID + PIN; the account decides the role.
 // The Super Admin is the only role that can create/manage accounts (incl. Owners/Admins).
@@ -585,6 +624,7 @@ export default function App() {
 
   const [restaurant, setRestaurant] = useState(RESTAURANT_DEFAULT);
   const [items, setItems] = useState(INITIAL_ITEMS);
+  const [categories, setCategories] = useState(DEFAULT_CATEGORIES);
   const [inventory, setInventory] = useState([]);
   const [orders, setOrders] = useState([]);
   const [held, setHeld] = useState([]);
@@ -599,7 +639,7 @@ export default function App() {
   const cloudResetAtRef = useRef(0);  // "Clear sales" watermark (ms since epoch) — see resetDemo
   const stateRef = useRef({});        // live state snapshot the pull loop can read
   useEffect(() => {
-    stateRef.current = { chai_staff: staff, chai_orders: orders, chai_expenses: expenses, chai_inventory: inventory, chai_menu: items, chai_restaurant: restaurant };
+    stateRef.current = { chai_staff: staff, chai_orders: orders, chai_expenses: expenses, chai_inventory: inventory, chai_menu: items, chai_categories: categories, chai_restaurant: restaurant };
   });
 
   // Storage adapter — three tiers:
@@ -639,6 +679,7 @@ export default function App() {
       else if (key === "chai_expenses" && Array.isArray(p)) setExpenses((prev) => mergeRecords(p, prev, "id", cloudResetAtRef.current));
       else if (key === "chai_inventory" && Array.isArray(p)) setInventory(p);
       else if (key === "chai_menu" && Array.isArray(p) && p.length > 0) setItems(p);
+      else if (key === "chai_categories" && Array.isArray(p) && p.length > 0) setCategories(p);
       else if (key === "chai_restaurant" && p && typeof p === "object") setRestaurant({ ...RESTAURANT_DEFAULT, ...p });
     } catch (e) { /* ignore malformed cloud value */ }
   };
@@ -687,6 +728,9 @@ export default function App() {
       const raw_menu = await safeGet("chai_menu");
       if (raw_menu) { try { const p = JSON.parse(raw_menu); if (Array.isArray(p) && p.length > 0) setItems(p); } catch(e){} }
 
+      const raw_cats = await safeGet("chai_categories");
+      if (raw_cats) { try { const p = JSON.parse(raw_cats); if (Array.isArray(p) && p.length > 0) setCategories(p); } catch(e){} }
+
       const raw_reset = await safeGet("chai_reset_at");
       if (raw_reset) cloudResetAtRef.current = Date.parse(raw_reset) || 0;
 
@@ -701,6 +745,7 @@ export default function App() {
   useEffect(() => { if (storageReady) safeSet("chai_inventory", JSON.stringify(inventory)); }, [inventory, storageReady]);
   useEffect(() => { if (storageReady) safeSet("chai_restaurant", JSON.stringify(restaurant)); }, [restaurant, storageReady]);
   useEffect(() => { if (storageReady) safeSet("chai_menu", JSON.stringify(items)); }, [items, storageReady]);
+  useEffect(() => { if (storageReady) safeSet("chai_categories", JSON.stringify(categories)); }, [categories, storageReady]);
 
   // ---- Cloud pull loop: bring other devices' changes onto this one ----
   useEffect(() => {
@@ -968,6 +1013,7 @@ export default function App() {
   ].filter((n) => allowed.includes(n.id));
 
   return (
+    <CategoriesContext.Provider value={categories}>
     <div style={{ ...vars, background: "var(--bg)", color: "var(--ink)" }} className="app-root w-full h-screen flex overflow-hidden">
       <StyleBlock />
 
@@ -1075,7 +1121,7 @@ export default function App() {
         </div>
 
         <div className="flex-1 overflow-y-auto thin-scroll">
-          {view === "dashboard" && <Dashboard stats={stats} todays={todays} items={items} restaurant={restaurant} dark={dark} expensesToday={expToday.total} expenseCount={expToday.list.length} />}
+          {view === "dashboard" && <Dashboard stats={stats} todays={todays} items={items} restaurant={restaurant} dark={dark} expensesToday={expToday.total} expenseCount={expToday.list.length} role={user.role} />}
           {view === "pos" && (
             <POS
               items={items} posCat={posCat} setPosCat={setPosCat} posSearch={posSearch} setPosSearch={setPosSearch}
@@ -1091,10 +1137,10 @@ export default function App() {
           )}
           {view === "orders" && <Orders orders={orders} setStatus={setStatus} reprint={setReceiptOrder} />}
           {view === "kitchen" && <Kitchen orders={orders} setStatus={setStatus} />}
-          {view === "menu" && <Menu items={items} setItems={setItems} setEditItem={setEditItem} flash={flash} />}
+          {view === "menu" && <Menu items={items} setItems={setItems} setEditItem={setEditItem} flash={flash} setCategories={setCategories} />}
           {view === "inventory" && <Inventory inventory={inventory} setInventory={setInventory} flash={flash} />}
           {view === "expenses" && <Expenses expenses={expenses} setExpenses={setExpenses} flash={flash} user={user} />}
-          {view === "reports" && <Reports orders={orders} todays={todays} items={items} restaurant={restaurant} expenses={expenses} />}
+          {view === "reports" && <Reports orders={orders} todays={todays} items={items} restaurant={restaurant} expenses={expenses} role={user.role} userName={user.name} />}
           {view === "users" && <UsersView staff={staff} setStaff={setStaff} currentUser={user} flash={flash} />}
           {view === "settings" && <SettingsView restaurant={restaurant} setRestaurant={setRestaurant} dark={dark} setDark={setDark} resetDemo={resetDemo} flash={flash} user={user} />}
         </div>
@@ -1123,6 +1169,7 @@ export default function App() {
           }} />
       )}
     </div>
+    </CategoriesContext.Provider>
   );
 }
 
@@ -1186,7 +1233,9 @@ function Login({ onLogin, staff = [] }) {
 }
 
 /* ============================ DASHBOARD ================================== */
-function Dashboard({ stats, todays, items, restaurant, dark, expensesToday = 0, expenseCount = 0 }) {
+function Dashboard({ stats, todays, items, restaurant, dark, expensesToday = 0, expenseCount = 0, role = "Owner" }) {
+  // Same rule as the reports: cashiers see takings and VAT, not cost or profit.
+  const showMoney = canSeeProfit(role);
   const salesAnim = useCountUp(stats.sales);
   const netProfit = round2(stats.profit - expensesToday);
   const profitAnim = useCountUp(netProfit);
@@ -1227,8 +1276,12 @@ function Dashboard({ stats, todays, items, restaurant, dark, expensesToday = 0, 
       {/* Hero metrics */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 md:gap-4">
         <HeroCard title="Today's Sales" value={`AED ${salesAnim.toFixed(2)}`} sub={`${stats.orders} orders`} Icon={TrendingUp} accent />
-        <HeroCard title="Today's Expenses" value={aed(expensesToday)} sub="logged today" Icon={ReceiptIcon} />
-        <HeroCard title="Net Profit" value={`AED ${profitAnim.toFixed(2)}`} sub="after food cost & expenses" Icon={Coins} />
+        {showMoney
+          ? <HeroCard title="Today's Expenses" value={aed(expensesToday)} sub="logged today" Icon={ReceiptIcon} />
+          : <HeroCard title="Net Sales" value={aed(stats.net)} sub="excluding VAT" Icon={Wallet} />}
+        {showMoney
+          ? <HeroCard title="Net Profit" value={`AED ${profitAnim.toFixed(2)}`} sub="after food cost & expenses" Icon={Coins} />
+          : <HeroCard title="Completed" value={String(stats.completed)} sub="orders closed today" Icon={CheckCircle2} />}
         <HeroCard title="VAT Collected" value={aed(stats.vat)} sub="5% output VAT" Icon={FileText} />
       </div>
 
@@ -1240,8 +1293,8 @@ function Dashboard({ stats, todays, items, restaurant, dark, expensesToday = 0, 
         <Stat label="Cancelled" value={stats.cancelled} color="#E6553A" Icon={XCircle} />
       </div>
 
-      {/* Daily Profit & Loss */}
-      <Card>
+      {/* Daily Profit & Loss — Owner/Manager only */}
+      {showMoney && <Card>
         <div className="flex items-center justify-between flex-wrap gap-3">
           <CardHead title="Daily Profit & Loss" sub={new Date().toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long", year: "numeric" })} />
           <span className="text-[11px] font-bold px-2.5 py-1 rounded-full" style={{ background: isProfit ? "rgba(31,157,107,0.12)" : "rgba(230,85,58,0.12)", color: isProfit ? "#1F9D6B" : "#E6553A" }}>
@@ -1270,7 +1323,7 @@ function Dashboard({ stats, todays, items, restaurant, dark, expensesToday = 0, 
             </div>
           </div>
         </div>
-      </Card>
+      </Card>}
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         {/* Sales graph */}
@@ -1372,6 +1425,7 @@ function POS(props) {
     totals, charge, holdBill, clearCart, held, resumeBill,
   } = props;
 
+  const CATEGORIES = useCategories();
   const q = posSearch.trim().toLowerCase();
   const catName = (id) => CATEGORIES.find((c) => c.id === id)?.name || "";
   const itemMatches = (it) => it.name.toLowerCase().includes(q) || catName(it.cat).toLowerCase().includes(q);
@@ -1733,24 +1787,35 @@ function Kitchen({ orders, setStatus }) {
 }
 
 /* ============================== MENU =================================== */
-function Menu({ items, setItems, setEditItem, flash }) {
+function Menu({ items, setItems, setEditItem, flash, setCategories }) {
+  const CATEGORIES = useCategories();
   const [cat, setCat] = useState("all");
+  const [showCats, setShowCats] = useState(false);
   const list = cat === "all" ? items : items.filter((i) => i.cat === cat);
   const toggle = (id) => setItems((prev) => prev.map((i) => i.id === id ? { ...i, available: !i.available } : i));
   const del = (id) => { setItems((prev) => prev.filter((i) => i.id !== id)); flash("Item deleted", "warn"); };
+  // New items land in the category you're filtered to, else the first one.
+  const newItemCat = CATEGORIES.some((c) => c.id === cat) ? cat : (CATEGORIES[0]?.id || "");
   return (
     <div className="p-4 md:p-6">
       <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
-        <h2 className="text-lg font-bold" style={{ fontFamily: "Fraunces, serif" }}>Menu Management <span className="text-sm font-normal" style={{ color: "var(--muted)" }}>• {items.length} items</span></h2>
-        <button onClick={() => setEditItem({ name: "", cat: "cmomo", price: "", cost: "", available: true })}
-          className="flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-bold text-white" style={{ background: SIDEBAR_GRAD }}>
-          <Plus size={16} /> Add Item
-        </button>
+        <h2 className="text-lg font-bold" style={{ fontFamily: "Fraunces, serif" }}>Menu Management <span className="text-sm font-normal" style={{ color: "var(--muted)" }}>• {items.length} items · {CATEGORIES.length} categories</span></h2>
+        <div className="flex gap-2">
+          <button onClick={() => setShowCats(true)}
+            className="flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-bold" style={{ background: "var(--surface)", color: "var(--purple)", border: "1px solid var(--line)" }}>
+            <Layers size={16} /> Categories
+          </button>
+          <button onClick={() => setEditItem({ name: "", cat: newItemCat, price: "", cost: "", available: true })}
+            className="flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-bold text-white" style={{ background: SIDEBAR_GRAD }}>
+            <Plus size={16} /> Add Item
+          </button>
+        </div>
       </div>
       <div className="flex gap-2 overflow-x-auto pb-3 thin-scroll">
         <Chip active={cat === "all"} onClick={() => setCat("all")}>All</Chip>
         {CATEGORIES.map((c) => <Chip key={c.id} active={cat === c.id} onClick={() => setCat(c.id)}>{c.emoji} {c.name}</Chip>)}
       </div>
+      {showCats && <CategoryManager items={items} setItems={setItems} setCategories={setCategories} flash={flash} onClose={() => setShowCats(false)} />}
       <Card pad="p-0">
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
@@ -1772,9 +1837,9 @@ function Menu({ items, setItems, setEditItem, flash }) {
                 return (
                   <tr key={it.id} style={{ borderBottom: "1px solid var(--line)" }} className="menu-row">
                     <td className="px-4 py-2.5 font-medium" style={{ color: "var(--ink)" }}>
-                      <span className="mr-2">{CATEGORIES.find((c) => c.id === it.cat)?.emoji}</span>{it.name}
+                      <span className="mr-2">{CATEGORIES.find((c) => c.id === it.cat)?.emoji || "📋"}</span>{it.name}
                     </td>
-                    <td className="px-4 py-2.5 hidden sm:table-cell" style={{ color: "var(--muted)" }}>{CATEGORIES.find((c) => c.id === it.cat)?.name}</td>
+                    <td className="px-4 py-2.5 hidden sm:table-cell" style={{ color: "var(--muted)" }}>{CATEGORIES.find((c) => c.id === it.cat)?.name || "Uncategorised"}</td>
                     <td className="px-4 py-2.5 text-right tnum" style={{ color: "var(--muted)" }}>{money(it.cost)}</td>
                     <td className="px-4 py-2.5 text-right font-bold tnum" style={{ color: "var(--purple)" }}>{money(it.price)}</td>
                     <td className="px-4 py-2.5 text-right hidden md:table-cell tnum" style={{ color: margin > 50 ? "#1F9D6B" : margin > 30 ? "#C19A2B" : "#E6553A" }}>{margin}%</td>
@@ -1799,10 +1864,160 @@ function Menu({ items, setItems, setEditItem, flash }) {
   );
 }
 
+/* ------------------------- CATEGORY MANAGER -------------------------------
+   Add, rename, re-order and remove menu categories. The list is saved and
+   synced like everything else, so a category added on one till appears on the
+   others within ~15 seconds.
+
+   Two rules keep old data honest:
+     • An id is generated once from the name and never changes, so renaming
+       "Fresh Juice" to "Juices & Shakes" does NOT orphan past orders.
+     • A category holding items cannot be deleted until those items are moved
+       to another category — the modal does the move for you.               */
+function CategoryManager({ items, setItems, setCategories, flash, onClose }) {
+  const CATEGORIES = useCategories();
+  const [name, setName] = useState("");
+  const [emoji, setEmoji] = useState("🍽️");
+  const [picker, setPicker] = useState(false);
+  const [editing, setEditing] = useState(null);   // id being renamed
+  const [editName, setEditName] = useState("");
+  const [moving, setMoving] = useState(null);     // category queued for deletion
+  const [moveTo, setMoveTo] = useState("");
+
+  const countIn = (id) => items.filter((i) => i.cat === id).length;
+
+  const add = () => {
+    const clean = name.trim();
+    if (!clean) { flash("Type a category name", "warn"); return; }
+    if (CATEGORIES.some((c) => c.name.toLowerCase() === clean.toLowerCase())) { flash("That category already exists", "warn"); return; }
+    const id = slugCat(clean, CATEGORIES.map((c) => c.id));
+    setCategories((prev) => [...prev, { id, name: clean, emoji: emoji || "🍽️" }]);
+    setName(""); setEmoji("🍽️"); setPicker(false);
+    flash(`Category "${clean}" added`);
+  };
+
+  const rename = (id) => {
+    const clean = editName.trim();
+    if (!clean) { setEditing(null); return; }
+    setCategories((prev) => prev.map((c) => c.id === id ? { ...c, name: clean } : c));
+    setEditing(null); flash("Category renamed");
+  };
+
+  const setEmojiFor = (id, e) => setCategories((prev) => prev.map((c) => c.id === id ? { ...c, emoji: e } : c));
+
+  // Order here is the order categories appear in POS and on the reports.
+  const move = (id, dir) => setCategories((prev) => {
+    const i = prev.findIndex((c) => c.id === id);
+    const j = i + dir;
+    if (i < 0 || j < 0 || j >= prev.length) return prev;
+    const next = [...prev];
+    [next[i], next[j]] = [next[j], next[i]];
+    return next;
+  });
+
+  const remove = (c) => {
+    if (CATEGORIES.length <= 1) { flash("Keep at least one category", "warn"); return; }
+    const n = countIn(c.id);
+    if (n > 0) { setMoving(c); setMoveTo(CATEGORIES.find((x) => x.id !== c.id)?.id || ""); return; }
+    setCategories((prev) => prev.filter((x) => x.id !== c.id));
+    flash(`Category "${c.name}" removed`, "warn");
+  };
+
+  const confirmMove = () => {
+    if (!moveTo) return;
+    const from = moving;
+    setItems((prev) => prev.map((i) => i.cat === from.id ? { ...i, cat: moveTo } : i));
+    setCategories((prev) => prev.filter((x) => x.id !== from.id));
+    setMoving(null);
+    flash(`"${from.name}" removed — items moved`, "warn");
+  };
+
+  return (
+    <Modal onClose={onClose} title="Menu Categories" wide>
+      {/* --- Add a new category --- */}
+      <div className="rounded-xl p-3 mb-4" style={{ background: "var(--surface2)", border: "1px solid var(--line)" }}>
+        <div className="text-xs font-semibold mb-2" style={{ color: "var(--muted)" }}>Add a new category</div>
+        <div className="flex gap-2">
+          <button onClick={() => setPicker((p) => !p)} title="Pick an icon"
+            className="w-12 shrink-0 rounded-xl text-xl flex items-center justify-center"
+            style={{ background: "var(--surface)", border: "1px solid var(--line)" }}>{emoji}</button>
+          <input value={name} onChange={(e) => setName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && add()}
+            className="modal-input flex-1" placeholder="e.g. Hot Drinks" />
+          <button onClick={add} disabled={!name.trim()}
+            className="px-4 rounded-xl text-sm font-bold text-white disabled:opacity-40 flex items-center gap-1"
+            style={{ background: SIDEBAR_GRAD }}><Plus size={15} /> Add</button>
+        </div>
+        {picker && (
+          <div className="grid grid-cols-10 gap-1 mt-2 p-2 rounded-xl max-h-32 overflow-y-auto thin-scroll" style={{ background: "var(--surface)", border: "1px solid var(--line)" }}>
+            {CATEGORY_EMOJIS.map((e) => (
+              <button key={e} onClick={() => { setEmoji(e); setPicker(false); }} className="text-lg rounded-lg py-0.5 hover:scale-125 transition-transform">{e}</button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* --- Existing categories --- */}
+      <div className="space-y-1.5 max-h-[46vh] overflow-y-auto thin-scroll pr-0.5">
+        {CATEGORIES.map((c, idx) => (
+          <div key={c.id} className="flex items-center gap-2 px-2.5 py-2 rounded-xl" style={{ background: "var(--surface2)", border: "1px solid var(--line)" }}>
+            <select value={c.emoji} onChange={(e) => setEmojiFor(c.id, e.target.value)} title="Change icon"
+              className="text-lg bg-transparent outline-none cursor-pointer" style={{ color: "var(--ink)", width: 34 }}>
+              {[c.emoji, ...CATEGORY_EMOJIS.filter((e) => e !== c.emoji)].map((e, i) => <option key={e + i} value={e}>{e}</option>)}
+            </select>
+            {editing === c.id ? (
+              <input autoFocus value={editName} onChange={(e) => setEditName(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") rename(c.id); if (e.key === "Escape") setEditing(null); }}
+                onBlur={() => rename(c.id)} className="modal-input flex-1 py-1" />
+            ) : (
+              <button onClick={() => { setEditing(c.id); setEditName(c.name); }} className="flex-1 text-left text-sm font-medium truncate" style={{ color: "var(--ink)" }} title="Tap to rename">
+                {c.name}
+              </button>
+            )}
+            <span className="text-[11px] tnum px-1.5 py-0.5 rounded-full shrink-0" style={{ background: "var(--surface)", color: "var(--muted)" }}>{countIn(c.id)}</span>
+            <button onClick={() => move(c.id, -1)} disabled={idx === 0} className="p-1 rounded-lg disabled:opacity-25" style={{ color: "var(--muted)" }} title="Move up"><ChevronUp size={16} /></button>
+            <button onClick={() => move(c.id, 1)} disabled={idx === CATEGORIES.length - 1} className="p-1 rounded-lg disabled:opacity-25" style={{ color: "var(--muted)" }} title="Move down"><ChevronDown size={16} /></button>
+            <button onClick={() => remove(c)} className="p-1 rounded-lg" style={{ color: "#E6553A" }} title="Remove"><Trash2 size={14} /></button>
+          </div>
+        ))}
+      </div>
+
+      {/* --- Deleting a category that still holds items --- */}
+      {moving && (
+        <div className="mt-3 p-3 rounded-xl" style={{ background: "rgba(230,85,58,0.08)", border: "1px solid rgba(230,85,58,0.35)" }}>
+          <div className="text-sm font-semibold mb-1" style={{ color: "var(--ink)" }}>
+            "{moving.name}" still has {countIn(moving.id)} {countIn(moving.id) === 1 ? "item" : "items"}
+          </div>
+          <div className="text-xs mb-2" style={{ color: "var(--muted)" }}>Move them to another category first — nothing gets deleted.</div>
+          <div className="flex gap-2">
+            <select value={moveTo} onChange={(e) => setMoveTo(e.target.value)} className="modal-input flex-1">
+              {CATEGORIES.filter((x) => x.id !== moving.id).map((x) => <option key={x.id} value={x.id}>{x.emoji} {x.name}</option>)}
+            </select>
+            <button onClick={confirmMove} className="px-3 rounded-xl text-sm font-bold text-white" style={{ background: "#E6553A" }}>Move & delete</button>
+            <button onClick={() => setMoving(null)} className="px-3 rounded-xl text-sm font-semibold" style={{ background: "var(--surface2)", color: "var(--ink)", border: "1px solid var(--line)" }}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      <p className="text-[11px] mt-3" style={{ color: "var(--muted)" }}>
+        Tap a name to rename it · arrows set the order shown in POS · saved and synced to every device.
+      </p>
+      <button onClick={onClose} className="w-full mt-3 py-2.5 rounded-xl text-sm font-bold text-white" style={{ background: SIDEBAR_GRAD }}>Done</button>
+    </Modal>
+  );
+}
+
 function ItemEditor({ item, onClose, onSave }) {
-  const [f, setF] = useState({ ...item, price: item.price ?? "", cost: item.cost ?? "" });
+  const CATEGORIES = useCategories();
+  const [f, setF] = useState({
+    ...item,
+    // If this item's category was removed, drop it into the first one instead
+    // of showing an empty picker.
+    cat: CATEGORIES.some((c) => c.id === item.cat) ? item.cat : (CATEGORIES[0]?.id || item.cat),
+    price: item.price ?? "",
+    cost: item.cost ?? "",
+  });
   const set = (k, v) => setF((p) => ({ ...p, [k]: v }));
-  const valid = f.name.trim() && Number(f.price) > 0;
+  const valid = f.name.trim() && Number(f.price) > 0 && f.cat;
   return (
     <Modal onClose={onClose} title={item.id ? "Edit Item" : "Add Item"}>
       <div className="space-y-3">
@@ -2269,11 +2484,16 @@ function ZDiv() {
   return <div style={{ borderTop: "1px dashed #000", margin: "6px 0" }} />;
 }
 
-function Reports({ orders, todays, items, restaurant, expenses = [] }) {
+function Reports({ orders, todays, items, restaurant, expenses = [], role = "Owner", userName = "" }) {
+  const CATEGORIES = useCategories();
+  // Cashiers get the sales side of the reports — takings, VAT, payment
+  // totals, item/category sales and the full Z Report — but no food cost,
+  // margin, expense or profit figures. See FINANCE_ROLES near the top.
+  const showMoney = canSeeProfit(role);
   const [range, setRange] = useState("today");
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
-  const [showZReport, setShowZReport] = useState(false);
+  const [showZReport, setShowZReport] = useState(!showMoney); // cashiers land on the Z Report
   const [printedAt, setPrintedAt] = useState(null); // timestamp shown on the printed Z report
 
   const todayStr = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; };
@@ -2360,7 +2580,7 @@ function Reports({ orders, todays, items, restaurant, expenses = [] }) {
       m[cn] = (m[cn] || 0) + l.price * l.qty;
     }));
     return Object.entries(m).map(([k, v]) => ({ category: k, value: round2(v) })).sort((a, b) => b.value - a.value);
-  }, [done, items]);
+  }, [done, items, CATEGORIES]);
 
   // Category-wise quantity + revenue for Z Report
   const byCatDetailed = useMemo(() => {
@@ -2379,7 +2599,7 @@ function Reports({ orders, todays, items, restaurant, expenses = [] }) {
       category: cat, qty: d.qty, revenue: round2(d.revenue),
       items: Object.entries(d.items).map(([name, v]) => ({ name, qty: v.qty, revenue: round2(v.revenue) })).sort((a, b) => b.revenue - a.revenue),
     })).sort((a, b) => b.revenue - a.revenue);
-  }, [done, items]);
+  }, [done, items, CATEGORIES]);
 
   // Hourly breakdown for Z Report
   const hourly = useMemo(() => {
@@ -2471,27 +2691,33 @@ function Reports({ orders, todays, items, restaurant, expenses = [] }) {
     XLSX.utils.book_append_sheet(wb, ws1, "Orders");
     const ws2 = XLSX.utils.json_to_sheet(itemSales.map((i) => ({ Item: i.name, Qty: i.qty, Revenue: round2(i.revenue) })));
     XLSX.utils.book_append_sheet(wb, ws2, "Item Sales");
-    const ws3 = XLSX.utils.json_to_sheet(expFiltered.map((e) => ({
-      Date: new Date(e.createdAt).toLocaleDateString("en-GB"),
-      Time: new Date(e.createdAt).toLocaleTimeString("en-GB"),
-      Category: EXPENSE_CATS.find((c) => c.id === e.cat)?.name || "Other",
-      Vendor: e.vendor, Items: expItemsText(e), Method: e.method, Amount: round2(e.amount),
-    })));
-    XLSX.utils.book_append_sheet(wb, ws3, "Expenses");
+    if (showMoney) {
+      const ws3 = XLSX.utils.json_to_sheet(expFiltered.map((e) => ({
+        Date: new Date(e.createdAt).toLocaleDateString("en-GB"),
+        Time: new Date(e.createdAt).toLocaleTimeString("en-GB"),
+        Category: EXPENSE_CATS.find((c) => c.id === e.cat)?.name || "Other",
+        Vendor: e.vendor, Items: expItemsText(e), Method: e.method, Amount: round2(e.amount),
+      })));
+      XLSX.utils.book_append_sheet(wb, ws3, "Expenses");
+    }
     // Day-wise summary sheet
-    const wsDaily = XLSX.utils.json_to_sheet(byDay.map((d) => ({
-      Date: d.date, Orders: d.orders, Gross: d.gross, VAT: d.vat, Expenses: d.expenses, NetProfit: d.net,
-    })));
+    const wsDaily = XLSX.utils.json_to_sheet(byDay.map((d) => (
+      showMoney
+        ? { Date: d.date, Orders: d.orders, Gross: d.gross, VAT: d.vat, Expenses: d.expenses, NetProfit: d.net }
+        : { Date: d.date, Orders: d.orders, Gross: d.gross, VAT: d.vat }
+    )));
     XLSX.utils.book_append_sheet(wb, wsDaily, "Daily Summary");
     // Z Report summary sheet
     const zRows = [
       { Metric: "Gross Sales (incl. VAT)", AED: round2(summary.sales) },
       { Metric: "Net Sales (excl VAT)", AED: round2(summary.net) },
       { Metric: "VAT 5%", AED: round2(summary.vat) },
-      { Metric: "Food Cost (COGS)", AED: round2(summary.net - summary.profit) },
-      { Metric: "Gross Profit", AED: round2(summary.profit) },
-      { Metric: "Expenses", AED: round2(expTotal) },
-      { Metric: "Net Profit", AED: round2(netAfterExp) },
+      ...(showMoney ? [
+        { Metric: "Food Cost (COGS)", AED: round2(summary.net - summary.profit) },
+        { Metric: "Gross Profit", AED: round2(summary.profit) },
+        { Metric: "Expenses", AED: round2(expTotal) },
+        { Metric: "Net Profit", AED: round2(netAfterExp) },
+      ] : []),
       { Metric: "---", AED: "---" },
       { Metric: "Total Orders", AED: summary.count },
       { Metric: "Cancelled Orders", AED: summary.cancelled },
@@ -2548,7 +2774,9 @@ function Reports({ orders, todays, items, restaurant, expenses = [] }) {
         <Stat label="Gross Sales" value={aed(summary.sales)} color="#6D28D9" Icon={TrendingUp} />
         <Stat label="Net Sales" value={aed(summary.net)} color="#9B7CF6" Icon={Wallet} />
         <Stat label="VAT (5%)" value={aed(summary.vat)} color="#C19A2B" Icon={FileText} />
-        <Stat label="Net Profit" value={aed(netAfterExp)} color={netAfterExp >= 0 ? "#1F9D6B" : "#E6553A"} Icon={Coins} />
+        {showMoney
+          ? <Stat label="Net Profit" value={aed(netAfterExp)} color={netAfterExp >= 0 ? "#1F9D6B" : "#E6553A"} Icon={Coins} />
+          : <Stat label="Discounts" value={aed(summary.disc)} color="#C19A2B" Icon={Percent} />}
         <Stat label="Orders" value={summary.count} color="#6D28D9" Icon={ClipboardList} />
         <Stat label="Cancelled" value={summary.cancelled} color="#E6553A" Icon={XCircle} />
       </div>
@@ -2663,7 +2891,7 @@ function Reports({ orders, todays, items, restaurant, expenses = [] }) {
         </Card>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      {showMoney && <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         {/* P&L */}
         <Card>
           <CardHead title="Profit & Loss Statement" sub="Complete P&L" />
@@ -2698,7 +2926,7 @@ function Reports({ orders, todays, items, restaurant, expenses = [] }) {
             })}
           </div>
         </Card>
-      </div>
+      </div>}
     </div>
   );
 
@@ -2739,11 +2967,12 @@ function Reports({ orders, todays, items, restaurant, expenses = [] }) {
             <Stat label="Gross Sales" value={aed(summary.sales)} color="#6D28D9" Icon={TrendingUp} />
             <Stat label="Net Sales" value={aed(summary.net)} color="#9B7CF6" Icon={Wallet} />
             <Stat label="VAT (5%)" value={aed(summary.vat)} color="#C19A2B" Icon={FileText} />
-            <Stat label="Gross Profit" value={aed(summary.profit)} color="#1F9D6B" Icon={Coins} />
-            <Stat label="Expenses" value={aed(expTotal)} color="#E6553A" Icon={ReceiptIcon} />
-            <Stat label="Net Profit" value={aed(netAfterExp)} color="#1F9D6B" Icon={TrendingUp} />
+            {showMoney && <Stat label="Gross Profit" value={aed(summary.profit)} color="#1F9D6B" Icon={Coins} />}
+            {showMoney && <Stat label="Expenses" value={aed(expTotal)} color="#E6553A" Icon={ReceiptIcon} />}
+            {showMoney && <Stat label="Net Profit" value={aed(netAfterExp)} color="#1F9D6B" Icon={TrendingUp} />}
             <Stat label="Discounts" value={aed(summary.disc)} color="#C19A2B" Icon={Percent} />
             <Stat label="Orders" value={summary.count} color="#6D28D9" Icon={ClipboardList} />
+            {!showMoney && <Stat label="Cancelled" value={summary.cancelled} color="#E6553A" Icon={XCircle} />}
           </div>
 
           {/* Day-wise breakdown — every trading date in the selected range */}
@@ -2757,21 +2986,21 @@ function Reports({ orders, todays, items, restaurant, expenses = [] }) {
                     <th className="text-right font-semibold px-4 py-3">Orders</th>
                     <th className="text-right font-semibold px-4 py-3">Gross Sales</th>
                     <th className="text-right font-semibold px-4 py-3">VAT</th>
-                    <th className="text-right font-semibold px-4 py-3">Expenses</th>
-                    <th className="text-right font-semibold px-4 py-3">Net Profit</th>
+                    {showMoney && <th className="text-right font-semibold px-4 py-3">Expenses</th>}
+                    {showMoney && <th className="text-right font-semibold px-4 py-3">Net Profit</th>}
                   </tr>
                 </thead>
                 <tbody>
                   {byDay.length === 0 ? (
-                    <tr><td colSpan={6} className="px-4 py-6 text-center" style={{ color: "var(--muted)" }}>No data in this range</td></tr>
+                    <tr><td colSpan={showMoney ? 6 : 4} className="px-4 py-6 text-center" style={{ color: "var(--muted)" }}>No data in this range</td></tr>
                   ) : byDay.map((d) => (
                     <tr key={d.date} style={{ borderBottom: "1px solid var(--line)" }}>
                       <td className="px-4 py-2.5 font-medium whitespace-nowrap" style={{ color: "var(--ink)" }}>{new Date(d.date + "T00:00:00").toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short", year: "numeric" })}</td>
                       <td className="px-4 py-2.5 text-right tnum" style={{ color: "var(--ink)" }}>{d.orders}</td>
                       <td className="px-4 py-2.5 text-right tnum font-semibold" style={{ color: "var(--purple)" }}>{money(d.gross)}</td>
                       <td className="px-4 py-2.5 text-right tnum" style={{ color: "var(--muted)" }}>{money(d.vat)}</td>
-                      <td className="px-4 py-2.5 text-right tnum" style={{ color: "#E6553A" }}>{d.expenses > 0 ? money(d.expenses) : "—"}</td>
-                      <td className="px-4 py-2.5 text-right tnum font-bold" style={{ color: d.net >= 0 ? "#1F9D6B" : "#E6553A" }}>{money(d.net)}</td>
+                      {showMoney && <td className="px-4 py-2.5 text-right tnum" style={{ color: "#E6553A" }}>{d.expenses > 0 ? money(d.expenses) : "—"}</td>}
+                      {showMoney && <td className="px-4 py-2.5 text-right tnum font-bold" style={{ color: d.net >= 0 ? "#1F9D6B" : "#E6553A" }}>{money(d.net)}</td>}
                     </tr>
                   ))}
                 </tbody>
@@ -2812,7 +3041,7 @@ function Reports({ orders, todays, items, restaurant, expenses = [] }) {
             </Card>
           </div>
 
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          {showMoney && <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             <Card>
               <CardHead title="Expenses by Category" sub={`Total ${aed(expTotal)}`} />
               <div className="mt-3 space-y-2.5">
@@ -2840,7 +3069,7 @@ function Reports({ orders, todays, items, restaurant, expenses = [] }) {
                 <KV k="Net Profit" v={aed(netAfterExp)} bold big />
               </div>
             </Card>
-          </div>
+          </div>}
 
           <Card pad="p-0">
             <CardHead title="Item-wise Sales" sub="Quantity & revenue" className="px-4 pt-4" />
@@ -2934,22 +3163,35 @@ function Reports({ orders, todays, items, restaurant, expenses = [] }) {
               <span style={{ width: "35%", textAlign: "right" }}>{money(h.revenue)}</span>
             </div>
           ))}
+          {/* Cost, profit and expense blocks print only for Owner/Manager.
+              A cashier's roll ends after the sales and cash-drawer figures. */}
+          {showMoney && (
+            <>
+              <ZDiv />
+              <ZSec>PROFIT &amp; LOSS • الربح والخسارة</ZSec>
+              <ZRow en="Gross Sales" ar="إجمالي المبيعات" val={money(summary.sales)} />
+              <ZRow en="− VAT (5%)" ar="ضريبة القيمة المضافة" val={`− ${money(summary.vat)}`} />
+              <ZRow en="Net Sales" ar="صافي المبيعات" val={money(summary.net)} bold />
+              <ZRow en="− Food Cost" ar="تكلفة الطعام" val={`− ${money(round2(summary.net - summary.profit))}`} />
+              <ZRow en="Gross Profit" ar="إجمالي الربح" val={money(summary.profit)} bold />
+              <ZRow en="− Expenses" ar="المصروفات" val={`− ${money(expTotal)}`} />
+              <ZRow en={netAfterExp >= 0 ? "NET PROFIT" : "NET LOSS"} ar="صافي الربح" val={`AED ${money(Math.abs(netAfterExp))}`} bold top />
+              <ZDiv />
+              <ZSec>EXPENSES • المصروفات</ZSec>
+              {expByCat.length === 0 ? (
+                <div style={{ textAlign: "center", padding: 4, color: "#666" }}>No expenses</div>
+              ) : expByCat.map((c) => <ZRow key={c.category} en={c.category} val={money(c.value)} />)}
+              <ZRow en="TOTAL EXPENSES" ar="إجمالي المصروفات" val={`AED ${money(expTotal)}`} bold top />
+            </>
+          )}
           <ZDiv />
-          <ZSec>PROFIT &amp; LOSS • الربح والخسارة</ZSec>
-          <ZRow en="Gross Sales" ar="إجمالي المبيعات" val={money(summary.sales)} />
-          <ZRow en="− VAT (5%)" ar="ضريبة القيمة المضافة" val={`− ${money(summary.vat)}`} />
-          <ZRow en="Net Sales" ar="صافي المبيعات" val={money(summary.net)} bold />
-          <ZRow en="− Food Cost" ar="تكلفة الطعام" val={`− ${money(round2(summary.net - summary.profit))}`} />
-          <ZRow en="Gross Profit" ar="إجمالي الربح" val={money(summary.profit)} bold />
-          <ZRow en="− Expenses" ar="المصروفات" val={`− ${money(expTotal)}`} />
-          <ZRow en={netAfterExp >= 0 ? "NET PROFIT" : "NET LOSS"} ar="صافي الربح" val={`AED ${money(Math.abs(netAfterExp))}`} bold top />
-          <ZDiv />
-          <ZSec>EXPENSES • المصروفات</ZSec>
-          {expByCat.length === 0 ? (
-            <div style={{ textAlign: "center", padding: 4, color: "#666" }}>No expenses</div>
-          ) : expByCat.map((c) => <ZRow key={c.category} en={c.category} val={money(c.value)} />)}
-          <ZRow en="TOTAL EXPENSES" ar="إجمالي المصروفات" val={`AED ${money(expTotal)}`} bold top />
-          <ZDiv />
+          {/* Who pulled the report and when — signed off at the bottom of the roll */}
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11 }}>
+            <span>Report by: <b>{userName || role}</b>{userName ? ` (${role})` : ""}</span>
+            <span>{(printedAt || new Date()).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" })}</span>
+          </div>
+          <div style={{ marginTop: 12, borderTop: "1px dotted #000", width: "60%" }} />
+          <div style={{ fontSize: 10 }}>Signature / التوقيع</div>
           <div style={{ textAlign: "center", marginTop: 10 }}>
             <div style={{ fontWeight: 700 }}>— End of Z Report —</div>
             <div dir="rtl">— نهاية التقرير —</div>
@@ -3291,10 +3533,10 @@ function ActionBtn({ onClick, Icon, label, green }) {
     </button>
   );
 }
-function Modal({ children, onClose, title }) {
+function Modal({ children, onClose, title, wide }) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 modal-overlay" onClick={onClose} style={{ background: "rgba(20,10,40,0.55)" }}>
-      <div className="w-full max-w-md rounded-2xl p-5 modal-in" onClick={(e) => e.stopPropagation()} style={{ background: "var(--surface)" }}>
+      <div className={`w-full ${wide ? "max-w-lg" : "max-w-md"} rounded-2xl p-5 modal-in`} onClick={(e) => e.stopPropagation()} style={{ background: "var(--surface)" }}>
         <div className="flex items-center justify-between mb-4">
           <h3 className="text-lg font-bold" style={{ color: "var(--ink)", fontFamily: "Fraunces, serif" }}>{title}</h3>
           <button onClick={onClose} className="p-1.5 rounded-lg" style={{ color: "var(--muted)" }}><X size={18} /></button>
