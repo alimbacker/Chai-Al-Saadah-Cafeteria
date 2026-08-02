@@ -396,8 +396,88 @@ function getRecipe(item) {
   return Object.entries(map).map(([name, qty]) => ({ name, qty }));
 }
 
-/* ----------------------------- HELPERS ------------------------------------ */
 const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+
+/* ------------------- STOCK LINK (menu item ↔ raw material) ------------------
+   Every sale should pull its raw materials out of stock on its own. A menu
+   item finds its materials in one of two ways:
+
+     1. A saved recipe — item.recipe = [{ id: "R123", qty: 1 }, ...]
+        Set in Menu → edit an item → Stock deduction. This always wins.
+     2. Name matching — nothing saved, so the item name is matched against the
+        raw-material list. "7 Up Can 330" on the menu finds "7 UP CAN 330" in
+        stock and pulls 1 per sale. Ready-to-sell goods (cans, bottles,
+        packaged snacks) work straight away with no setup at all.
+
+   item.recipe = [] means this item never touches stock.
+--------------------------------------------------------------------------- */
+const normName = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+
+// Packaging and portion words describe the tin, not the drink inside it.
+// Ignoring them lets "7 Up" on the menu still find "7 UP CAN 330" in stock.
+const NOISE_WORDS = new Set([
+  "can", "cans", "bottle", "bottles", "tin", "pcs", "pc", "piece", "pieces",
+  "pack", "packet", "box", "glass", "cup", "plate", "set", "portion",
+  "small", "medium", "big", "large", "regular", "reg", "half", "full",
+  "s", "m", "l", "b",
+]);
+const nameTokens = (s) => normName(s).split(" ").filter((t) => t && !NOISE_WORDS.has(t));
+
+/* How well a menu name matches a raw-material name. 0 means no match at all. */
+function matchScore(menuName, materialName) {
+  const a = normName(menuName), b = normName(materialName);
+  if (!a || !b) return 0;
+  if (a === b) return 100;                       // "Pepsi Can 330" = "PEPSI CAN 330"
+  const ta = nameTokens(menuName), tb = nameTokens(materialName);
+  if (!ta.length || !tb.length) return 0;
+  if (ta.join(" ") === tb.join(" ")) return 90;  // same words, different packaging noise
+  // One name is the other plus a describing word: "Steam Chicken Momo" → "CHICKEN MOMO".
+  // Only one extra word is allowed, so "Sweet Corn Chicken Soup" never grabs "CHICKEN".
+  const covered = ta.every((t) => tb.includes(t)) || tb.every((t) => ta.includes(t));
+  return covered ? 70 - 4 * Math.abs(ta.length - tb.length) : 0;
+}
+
+/* The single best raw material for a menu item name, or null if none is close. */
+function autoMatchMaterial(menuName, inventory) {
+  let best = null, bestScore = 0;
+  (inventory || []).forEach((ing) => {
+    const s = matchScore(menuName, ing.name);
+    if (s > bestScore) { bestScore = s; best = ing; }
+  });
+  return bestScore >= 65 ? best : null;
+}
+
+/* What one sale of this item takes out of stock. Empty means it deducts nothing. */
+function resolveRecipe(item, inventory) {
+  if (!item) return [];
+  const inv = inventory || [];
+  const line = (ing, qty, auto) => ({ id: ing.id, name: ing.name, unit: ing.unit, qty: round2(qty), auto });
+
+  if (Array.isArray(item.recipe)) {
+    return item.recipe
+      .map((r) => { const ing = inv.find((i) => i.id === r.id); return ing && Number(r.qty) > 0 ? line(ing, Number(r.qty), false) : null; })
+      .filter(Boolean);
+  }
+  const hit = autoMatchMaterial(item.name, inv);
+  if (hit) return [line(hit, 1, true)];
+  // Last resort: the built-in category recipes, but only for materials this
+  // cafeteria actually stocks — a demo name like "Flour" is skipped otherwise.
+  return getRecipe(item)
+    .map((r) => { const ing = inv.find((i) => normName(i.name) === normName(r.name)); return ing ? line(ing, r.qty, true) : null; })
+    .filter(Boolean);
+}
+
+/* Total raw material an order consumes, keyed by material id. */
+function recipeTotals(orderLines, items, inventory) {
+  const need = {};
+  (orderLines || []).forEach((l) => {
+    const it = items.find((i) => i.id === l.itemId) || { name: l.name, cat: "" };
+    resolveRecipe(it, inventory).forEach((r) => { need[r.id] = round2((need[r.id] || 0) + r.qty * l.qty); });
+  });
+  return need;
+}
+
+/* ----------------------------- HELPERS ------------------------------------ */
 const aed = (n) => "AED " + round2(n).toFixed(2);
 const money = (n) => round2(n).toFixed(2);
 
@@ -870,18 +950,25 @@ export default function App() {
     [lines, discMode, discValue, serviceOn, restaurant.servicePct]
   );
 
-  function deductInventory(orderLines) {
+  /* --------------------------- STOCK MOVEMENTS ---------------------------
+     A sale takes raw material out of stock; cancelling that order puts it
+     back. Matching is done on material id, so renaming "7 UP CAN 330" later
+     never breaks the link.                                                */
+  function applyStock(orderLines, sign = -1) {
     setInventory((prev) => {
-      const need = {};
-      orderLines.forEach((l) => {
-        const it = items.find((i) => i.id === l.itemId);
-        if (!it) return;
-        getRecipe(it).forEach((r) => { need[r.name] = (need[r.name] || 0) + r.qty * l.qty; });
-      });
-      return prev.map((ing) => need[ing.name]
-        ? { ...ing, stock: Math.max(0, round2(ing.stock - need[ing.name])) }
+      const need = recipeTotals(orderLines, items, prev);
+      const ids = Object.keys(need);
+      if (!ids.length) return prev;
+      return prev.map((ing) => need[ing.id] != null
+        ? { ...ing, stock: Math.max(0, round2(ing.stock + sign * need[ing.id])) }
         : ing);
     });
+  }
+
+  /* Materials an order needs more of than we hold — used to warn the cashier. */
+  function stockShortages(orderLines) {
+    const need = recipeTotals(orderLines, items, inventory);
+    return inventory.filter((ing) => need[ing.id] > ing.stock).map((ing) => ing.name);
   }
 
   function charge() {
@@ -921,11 +1008,15 @@ export default function App() {
       cashier: user?.name || "Administrator",
       createdAt: new Date().toISOString(),
     };
+    const short = stockShortages(order.lines);
     setOrders((prev) => [order, ...prev]);
-    deductInventory(order.lines);
+    applyStock(order.lines, -1);
     setReceiptOrder(order);
     clearCart();
-    flash("Order charged successfully");
+    flash(
+      short.length ? `Charged — stock now empty for ${short.join(", ")}` : "Order charged successfully",
+      short.length ? "warn" : "ok"
+    );
   }
 
   function holdBill() {
@@ -948,8 +1039,17 @@ export default function App() {
     flash("Bill resumed");
   }
 
-  const setStatus = (id, status) =>
-    setOrders((prev) => prev.map((o) => o.id === id ? { ...o, status, updatedAt: new Date().toISOString() } : o));
+  const setStatus = (id, status) => {
+    const o = orders.find((x) => x.id === id);
+    // Cancelling an order returns its raw material; re-opening takes it out again.
+    if (o && status !== o.status) {
+      if (status === "Cancelled" && !o.stockReturned) applyStock(o.lines, +1);
+      else if (o.status === "Cancelled" && o.stockReturned) applyStock(o.lines, -1);
+    }
+    setOrders((prev) => prev.map((x) => x.id === id
+      ? { ...x, status, stockReturned: status === "Cancelled", updatedAt: new Date().toISOString() }
+      : x));
+  };
 
   /* ----------------------------- DERIVED --------------------------------- */
   const todays = useMemo(() => {
@@ -1137,7 +1237,7 @@ export default function App() {
           )}
           {view === "orders" && <Orders orders={orders} setStatus={setStatus} reprint={setReceiptOrder} />}
           {view === "kitchen" && <Kitchen orders={orders} setStatus={setStatus} />}
-          {view === "menu" && <Menu items={items} setItems={setItems} setEditItem={setEditItem} flash={flash} setCategories={setCategories} />}
+          {view === "menu" && <Menu items={items} setItems={setItems} setEditItem={setEditItem} flash={flash} setCategories={setCategories} inventory={inventory} />}
           {view === "inventory" && <Inventory inventory={inventory} setInventory={setInventory} flash={flash} />}
           {view === "expenses" && <Expenses expenses={expenses} setExpenses={setExpenses} flash={flash} user={user} />}
           {view === "reports" && <Reports orders={orders} todays={todays} items={items} restaurant={restaurant} expenses={expenses} role={user.role} userName={user.name} />}
@@ -1162,7 +1262,7 @@ export default function App() {
 
       {/* Edit item modal */}
       {editItem && (
-        <ItemEditor item={editItem} onClose={() => setEditItem(null)}
+        <ItemEditor item={editItem} inventory={inventory} onClose={() => setEditItem(null)}
           onSave={(it) => {
             setItems((prev) => it.id ? prev.map((p) => p.id === it.id ? it : p) : [...prev, { ...it, id: "I" + Date.now() }]);
             setEditItem(null); flash(it.id ? "Item updated" : "Item added");
@@ -1787,7 +1887,7 @@ function Kitchen({ orders, setStatus }) {
 }
 
 /* ============================== MENU =================================== */
-function Menu({ items, setItems, setEditItem, flash, setCategories }) {
+function Menu({ items, setItems, setEditItem, flash, setCategories, inventory = [] }) {
   const CATEGORIES = useCategories();
   const [cat, setCat] = useState("all");
   const [showCats, setShowCats] = useState(false);
@@ -1826,6 +1926,7 @@ function Menu({ items, setItems, setEditItem, flash, setCategories }) {
                 <th className="text-right font-semibold px-4 py-3">Cost</th>
                 <th className="text-right font-semibold px-4 py-3">Price</th>
                 <th className="text-right font-semibold px-4 py-3 hidden md:table-cell">Margin</th>
+                <th className="text-left font-semibold px-4 py-3 hidden lg:table-cell">Deducts from stock</th>
                 <th className="text-center font-semibold px-4 py-3">Status</th>
                 <th className="text-right font-semibold px-4 py-3">Actions</th>
               </tr>
@@ -1834,6 +1935,9 @@ function Menu({ items, setItems, setEditItem, flash, setCategories }) {
               {list.map((it) => {
                 const net = it.price / (1 + VAT_RATE);
                 const margin = net > 0 ? Math.round(((net - it.cost) / net) * 100) : 0;
+                const link = resolveRecipe(it, inventory);
+                const byName = link.length > 0 && link[0].auto;
+                const linkText = link.map((r) => `${r.qty} ${r.unit} ${r.name}`).join(", ");
                 return (
                   <tr key={it.id} style={{ borderBottom: "1px solid var(--line)" }} className="menu-row">
                     <td className="px-4 py-2.5 font-medium" style={{ color: "var(--ink)" }}>
@@ -1842,7 +1946,17 @@ function Menu({ items, setItems, setEditItem, flash, setCategories }) {
                     <td className="px-4 py-2.5 hidden sm:table-cell" style={{ color: "var(--muted)" }}>{CATEGORIES.find((c) => c.id === it.cat)?.name || "Uncategorised"}</td>
                     <td className="px-4 py-2.5 text-right tnum" style={{ color: "var(--muted)" }}>{money(it.cost)}</td>
                     <td className="px-4 py-2.5 text-right font-bold tnum" style={{ color: "var(--purple)" }}>{money(it.price)}</td>
-                    <td className="px-4 py-2.5 text-right hidden md:table-cell tnum" style={{ color: margin > 50 ? "#1F9D6B" : margin > 30 ? "#C19A2B" : "#E6553A" }}>{margin}%</td>
+                    <td className="px-4 py-2.5 hidden lg:table-cell text-xs" title={link.length ? `${linkText}${byName ? " (matched by name)" : ""}` : "Nothing is deducted when this item sells"}>
+                      {link.length === 0 ? (
+                        <span style={{ color: "var(--muted)", opacity: 0.6 }}>Not linked</span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1.5" style={{ color: "var(--muted)" }}>
+                          <Package size={12} style={{ color: byName ? "#C19A2B" : "#1F9D6B" }} />
+                          <span className="truncate inline-block max-w-[190px] align-bottom">{link.length > 1 ? `${link.length} materials` : linkText}</span>
+                          {byName && <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full" style={{ background: "#FBF3DE", color: "#8A6A11" }}>auto</span>}
+                        </span>
+                      )}
+                    </td>
                     <td className="px-4 py-2.5 text-center">
                       <button onClick={() => toggle(it.id)} className="text-[11px] font-bold px-2 py-1 rounded-full"
                         style={{ background: it.available ? "#E7F7F0" : "#FDE9E5", color: it.available ? "#1F9D6B" : "#E6553A" }}>
@@ -2006,7 +2120,7 @@ function CategoryManager({ items, setItems, setCategories, flash, onClose }) {
   );
 }
 
-function ItemEditor({ item, onClose, onSave }) {
+function ItemEditor({ item, inventory = [], onClose, onSave }) {
   const CATEGORIES = useCategories();
   const [f, setF] = useState({
     ...item,
@@ -2016,11 +2130,24 @@ function ItemEditor({ item, onClose, onSave }) {
     price: item.price ?? "",
     cost: item.cost ?? "",
   });
+  // null keeps the automatic name match; an array is a recipe set by hand.
+  const [recipe, setRecipe] = useState(Array.isArray(item.recipe) ? item.recipe.map((r) => ({ ...r })) : null);
   const set = (k, v) => setF((p) => ({ ...p, [k]: v }));
+  const auto = recipe === null;
+  const autoHit = useMemo(() => (auto ? autoMatchMaterial(f.name, inventory) : null), [auto, f.name, inventory]);
+  const setRow = (idx, patch) => setRecipe((rs) => rs.map((r, i) => (i === idx ? { ...r, ...patch } : r)));
   const valid = f.name.trim() && Number(f.price) > 0 && f.cat;
+
+  const save = () => {
+    const out = { ...f, price: Number(f.price), cost: Number(f.cost) || 0 };
+    if (auto) delete out.recipe;
+    else out.recipe = recipe.filter((r) => r.id && Number(r.qty) > 0).map((r) => ({ id: r.id, qty: round2(r.qty) }));
+    onSave(out);
+  };
+
   return (
-    <Modal onClose={onClose} title={item.id ? "Edit Item" : "Add Item"}>
-      <div className="space-y-3">
+    <Modal onClose={onClose} title={item.id ? "Edit Item" : "Add Item"} wide>
+      <div className="space-y-3 max-h-[65vh] overflow-y-auto thin-scroll pr-1">
         <Field label="Item name"><input value={f.name} onChange={(e) => set("name", e.target.value)} className="modal-input" placeholder="e.g. Steam Chicken Momo" /></Field>
         <Field label="Category">
           <select value={f.cat} onChange={(e) => set("cat", e.target.value)} className="modal-input">
@@ -2035,10 +2162,68 @@ function ItemEditor({ item, onClose, onSave }) {
           <input type="checkbox" checked={f.available} onChange={(e) => set("available", e.target.checked)} className="w-4 h-4" />
           Available for sale
         </label>
+
+        {/* Stock deduction — what leaves the store room each time this sells */}
+        <div className="pt-3 mt-1" style={{ borderTop: "1px solid var(--line)" }}>
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-sm font-bold" style={{ color: "var(--ink)" }}>Stock deduction</span>
+            {auto ? (
+              <button onClick={() => setRecipe(autoHit ? [{ id: autoHit.id, qty: 1 }] : [])}
+                className="text-xs font-semibold px-2.5 py-1 rounded-lg" style={{ color: "var(--purple)", background: "var(--surface2)" }}>
+                Choose materials
+              </button>
+            ) : (
+              <button onClick={() => setRecipe(null)}
+                className="text-xs font-semibold px-2.5 py-1 rounded-lg" style={{ color: "var(--purple)", background: "var(--surface2)" }}>
+                Match by name
+              </button>
+            )}
+          </div>
+
+          {auto ? (
+            <div className="text-xs px-3 py-2.5 rounded-xl" style={{ background: autoHit ? "#E7F7F0" : "#FBF3DE", color: autoHit ? "#1F7A55" : "#8A6A11" }}>
+              {autoHit
+                ? <>Selling this takes <b>1 {autoHit.unit} of {autoHit.name}</b> out of stock, matched by name.</>
+                : inventory.length === 0
+                  ? <>Add raw materials in Inventory first, then sales will start deducting.</>
+                  : <>No raw material matches “{f.name || "this item"}”, so nothing is deducted. Choose materials to link it by hand.</>}
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {recipe.length === 0 && (
+                <p className="text-xs px-3 py-2.5 rounded-xl" style={{ background: "var(--surface2)", color: "var(--muted)" }}>
+                  Nothing is deducted when this item sells. Add a material below.
+                </p>
+              )}
+              {recipe.map((r, idx) => {
+                const ing = inventory.find((i) => i.id === r.id);
+                return (
+                  <div key={idx} className="grid grid-cols-12 gap-2 items-center">
+                    <select value={r.id || ""} onChange={(e) => setRow(idx, { id: e.target.value })} className="modal-input col-span-7">
+                      <option value="">Select material…</option>
+                      {inventory.map((i) => <option key={i.id} value={i.id}>{i.name}</option>)}
+                    </select>
+                    <input type="number" inputMode="decimal" min="0" step="0.01" value={r.qty}
+                      onChange={(e) => setRow(idx, { qty: e.target.value })} placeholder="1" className="modal-input tnum col-span-3" />
+                    <span className="col-span-1 text-xs" style={{ color: "var(--muted)" }}>{ing?.unit || ""}</span>
+                    <button onClick={() => setRecipe((rs) => rs.filter((_, i) => i !== idx))}
+                      className="col-span-1 w-8 h-8 rounded-lg inline-flex items-center justify-center justify-self-end"
+                      style={{ color: "#E6553A", background: "var(--surface2)" }} aria-label="Remove material"><Trash2 size={14} /></button>
+                  </div>
+                );
+              })}
+              <button onClick={() => setRecipe((rs) => [...rs, { id: "", qty: 1 }])}
+                className="inline-flex items-center gap-1.5 text-xs font-bold px-3 py-2 rounded-xl" style={{ color: "var(--purple)", background: "var(--surface2)" }}>
+                <Plus size={14} /> Add material
+              </button>
+              <p className="text-[11px]" style={{ color: "var(--muted)" }}>Quantity used per one item sold.</p>
+            </div>
+          )}
+        </div>
       </div>
       <div className="flex gap-2 mt-5">
         <button onClick={onClose} className="flex-1 py-2.5 rounded-xl text-sm font-semibold" style={{ background: "var(--surface2)", color: "var(--ink)", border: "1px solid var(--line)" }}>Cancel</button>
-        <button disabled={!valid} onClick={() => onSave({ ...f, price: Number(f.price), cost: Number(f.cost) || 0 })}
+        <button disabled={!valid} onClick={save}
           className="flex-1 py-2.5 rounded-xl text-sm font-bold text-white disabled:opacity-40 flex items-center justify-center gap-1.5" style={{ background: SIDEBAR_GRAD }}>
           <Save size={15} /> Save
         </button>
@@ -2140,7 +2325,9 @@ function Inventory({ inventory, setInventory, flash }) {
           </table>
         </div>
       </Card>
-      <p className="text-xs" style={{ color: "var(--muted)" }}>Stock auto-deducts after every sale based on a simplified recipe map. Adjust buttons add +5 or remove −1 unit (e.g. when receiving a purchase).</p>
+      <p className="text-xs" style={{ color: "var(--muted)" }}>
+        Stock comes down on its own after every sale. A menu item is matched to its material by name — sell a 7 Up and “7 UP CAN 330” drops by one — or you can set exact quantities under Menu → edit an item → Stock deduction. Cancelling an order puts the stock back. The buttons above add +5 or remove −1, for when a delivery arrives or something is wasted.
+      </p>
     </div>
   );
 }
