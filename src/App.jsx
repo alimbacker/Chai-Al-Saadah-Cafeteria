@@ -173,7 +173,7 @@ const CLOUD_KEY =
   envVar("VITE_SUPABASE_ANON_KEY", "NEXT_PUBLIC_SUPABASE_ANON_KEY", "REACT_APP_SUPABASE_ANON_KEY") ||
   (typeof window !== "undefined" && window.POS_SUPABASE_ANON_KEY) || "";
 const CLOUD_ENABLED = Boolean(CLOUD_URL && CLOUD_KEY);
-const SYNC_INTERVAL_MS = (typeof window !== "undefined" && window.POS_SYNC_MS) || 15000;
+const SYNC_INTERVAL_MS = (typeof window !== "undefined" && window.POS_SYNC_MS) || 30000;
 
 // Boot diagnostic — open DevTools (F12) → Console to see whether this build
 // is actually talking to Supabase. "cloud sync OFF" means logins and sales
@@ -197,20 +197,47 @@ const sbHeaders = () => ({
   "Content-Type": "application/json",
 });
 
+// Egress control: values (especially chai_orders) can be hundreds of KB, so we
+// never download one unless its updated_at stamp differs from what this device
+// last saw. cloudStamps() is a few hundred bytes for the whole table.
+const cloudStampsRef = { current: {} }; // key -> updated_at last seen/written by this device
+
+async function cloudStamps() {
+  const res = await fetch(`${CLOUD_URL}/rest/v1/pos_kv?select=key,updated_at`, { headers: sbHeaders() });
+  if (!res.ok) throw new Error(`cloud stamps: HTTP ${res.status}`);
+  const rows = await res.json();
+  const out = {};
+  rows.forEach((r) => { out[r.key] = r.updated_at; });
+  return out;
+}
+
 async function cloudGet(key) {
-  const res = await fetch(`${CLOUD_URL}/rest/v1/pos_kv?key=eq.${encodeURIComponent(key)}&select=value`, { headers: sbHeaders() });
+  const res = await fetch(`${CLOUD_URL}/rest/v1/pos_kv?key=eq.${encodeURIComponent(key)}&select=value,updated_at`, { headers: sbHeaders() });
   if (!res.ok) throw new Error(`cloud read ${key}: HTTP ${res.status}`);
   const rows = await res.json();
-  return rows.length ? rows[0].value : null;
+  if (!rows.length) return null;
+  cloudStampsRef.current[key] = rows[0].updated_at;
+  return rows[0].value;
+}
+
+// Download only if the cloud copy changed since we last saw it; otherwise
+// return `cached` (the value this device already holds) with zero egress.
+async function cloudGetIfChanged(key, cached, stamps) {
+  const remoteStamp = stamps ? stamps[key] : undefined;
+  if (stamps && remoteStamp === undefined) return null;               // key absent in cloud
+  if (cached != null && remoteStamp && remoteStamp === cloudStampsRef.current[key]) return cached;
+  return cloudGet(key);
 }
 
 async function cloudPut(key, value) {
+  const updated_at = new Date().toISOString();
   const res = await fetch(`${CLOUD_URL}/rest/v1/pos_kv?on_conflict=key`, {
     method: "POST",
-    headers: { ...sbHeaders(), Prefer: "resolution=merge-duplicates" },
-    body: JSON.stringify([{ key, value, updated_at: new Date().toISOString() }]),
+    headers: { ...sbHeaders(), Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify([{ key, value, updated_at }]),
   });
   if (!res.ok) throw new Error(`cloud write ${key}: HTTP ${res.status}`);
+  cloudStampsRef.current[key] = updated_at;
 }
 
 // Merge two record arrays by id; for the same id the record with the newer
@@ -802,7 +829,8 @@ export default function App() {
       let out = val;
       if (CLOUD_MERGE_KEYS[key]) {
         // merge with the cloud copy so we never overwrite another till's records
-        const remote = await cloudGet(key);
+        const stamps = await cloudStamps();
+        const remote = await cloudGetIfChanged(key, lastSyncedRef.current[key], stamps);
         out = JSON.stringify(mergeRecords(remote ? JSON.parse(remote) : [], JSON.parse(val), CLOUD_MERGE_KEYS[key], cloudResetAtRef.current));
       }
       await cloudPut(key, out);
@@ -860,10 +888,16 @@ export default function App() {
     if (!CLOUD_ENABLED || !storageReady) return;
     let stopped = false;
     const pull = async () => {
+      // A till sitting in a background tab doesn't need to poll at all.
+      if (typeof document !== "undefined" && document.hidden && cloudPrimedRef.current) return;
       try {
+        const stamps = await cloudStamps(); // one tiny request per cycle
+        if (stopped) return;
         for (const key of SYNC_KEYS) {
-          const remote = await cloudGet(key);
+          const known = lastSyncedRef.current[key];
+          const remote = await cloudGetIfChanged(key, known, stamps);
           if (stopped) return;
+          if (remote != null && remote === known && key !== "chai_reset_at") continue; // unchanged — nothing downloaded
           if (remote == null) {
             // Cloud has nothing for this key yet — the very first device seeds it.
             if (!cloudPrimedRef.current && key !== "chai_reset_at" && stateRef.current[key] != null) {
@@ -875,6 +909,7 @@ export default function App() {
           }
           if (key === "chai_reset_at") {
             // another device pressed "Clear sales" — drop records older than the watermark
+            lastSyncedRef.current[key] = remote;
             const t = Date.parse(remote) || 0;
             if (t > cloudResetAtRef.current) {
               cloudResetAtRef.current = t;
@@ -911,7 +946,9 @@ export default function App() {
     };
     pull();
     const t = setInterval(pull, SYNC_INTERVAL_MS);
-    return () => { stopped = true; clearInterval(t); };
+    const onVis = () => { if (typeof document !== "undefined" && !document.hidden) pull(); };
+    if (typeof document !== "undefined") document.addEventListener("visibilitychange", onVis);
+    return () => { stopped = true; clearInterval(t); if (typeof document !== "undefined") document.removeEventListener("visibilitychange", onVis); };
   }, [storageReady]);
 
   // POS cart
